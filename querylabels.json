@@ -1,0 +1,16 @@
+{
+  "cursor": "1",
+  "labels": [
+    {
+      "ver": 1,
+      "src": "did:plc:rh3vjqs4npfpmnkkmx4u4bzj",
+      "uri": "at://did:plc:bd3kgjmtrhqvomqsmoroazss/app.bsky.feed.post/3mgvk6aafwk2x",
+      "cid": "bafyreigd7z65dffy5dhlctudxkqcq6y7oqlqrrpkgeaywabaj7wpi7m3ei",
+      "val": "missing-alt-text",
+      "cts": "2026-03-13T17:16:18.478Z",
+      "sig": {
+        "$bytes": "1ZJQW8oBZJ+wsiDtnSQNAZaGROlGzuhjwRrQqn8Dk2A8bu86PDwmB0I/FhdvfFnZjuJHHYUE7qSNvvqnTE3WEQ"
+      }
+    }
+  ]
+}
