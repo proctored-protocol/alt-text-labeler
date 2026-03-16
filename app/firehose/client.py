@@ -1,6 +1,10 @@
 import logging
 
-from atproto import FirehoseSubscribeReposClient, models, parse_subscribe_repos_message
+from atproto import (
+    FirehoseSubscribeReposClient,
+    models,
+    parse_subscribe_repos_message,
+)
 
 from app.config import get_settings
 from app.db import SessionLocal
@@ -51,18 +55,16 @@ class FirehoseWorker:
 
     def on_message(self, message) -> None:
         parsed = parse_subscribe_repos_message(message)
-
         if not isinstance(parsed, models.ComAtprotoSyncSubscribeRepos.Commit):
             return
-
         self._handle_commit(parsed)
 
     def _handle_commit(self, commit: models.ComAtprotoSyncSubscribeRepos.Commit) -> None:
         processed_posts = 0
 
         with SessionLocal() as session:
-            try:
-                for post in iter_post_creates(commit):
+            for post in iter_post_creates(commit):
+                try:
                     if not post.image_alts:
                         continue
 
@@ -76,6 +78,7 @@ class FirehoseWorker:
                         partial_label=self.settings.label_partial_alt,
                         last_seen_seq=commit.seq,
                     )
+
                     if result is None:
                         continue
 
@@ -112,28 +115,54 @@ class FirehoseWorker:
                                 },
                             )
                         else:
-                            publish_label_via_ozone(
-                                session=session,
-                                uri=result.uri,
-                                cid=result.cid,
-                                label_value=result.derived_label,
-                            )
-                            logger.info(
-                                "label_published_via_ozone",
-                                extra={
-                                    "uri": result.uri,
-                                    "cid": result.cid,
-                                    "label_value": result.derived_label,
-                                },
-                            )
+                            try:
+                                publish_label_via_ozone(
+                                    session=session,
+                                    uri=result.uri,
+                                    cid=result.cid,
+                                    label_value=result.derived_label,
+                                )
+                                logger.info(
+                                    "label_published_via_ozone",
+                                    extra={
+                                        "uri": result.uri,
+                                        "cid": result.cid,
+                                        "label_value": result.derived_label,
+                                    },
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "label_publication_failed",
+                                    extra={
+                                        "repo": commit.repo,
+                                        "seq": commit.seq,
+                                        "uri": result.uri,
+                                        "cid": result.cid,
+                                        "label_value": result.derived_label,
+                                    },
+                                )
 
+                    # Critical: persist evaluation rows even if publication failed.
+                    session.commit()
+
+                except Exception:
+                    session.rollback()
+                    logger.exception(
+                        "post_processing_failed",
+                        extra={
+                            "repo": commit.repo,
+                            "seq": commit.seq,
+                            "uri": getattr(post, "uri", None),
+                        },
+                    )
+
+            try:
                 save_cursor(session, commit.seq)
                 session.commit()
-
             except Exception:
                 session.rollback()
                 logger.exception(
-                    "commit_processing_failed",
+                    "cursor_save_failed",
                     extra={"repo": commit.repo, "seq": commit.seq},
                 )
                 return

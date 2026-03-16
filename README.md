@@ -162,6 +162,19 @@ python scripts/publish_one_to_ozone.py "<URI>" "<CID>" "missing-alt-text"
 python scripts/check_post_labels.py "<AT_URI>"
 ```
 
+### VPS Monitoring Commands
+
+```bash
+journalctl -u alt-text-labeler-worker -f
+```
+
+```bash
+cd /srv/alt-text-labeler
+source .venv/bin/activate
+python scripts/show_counts.py
+python scripts/show_publication_counts.py
+```
+
 ## Configuration
 
 ### Key local environment variables
