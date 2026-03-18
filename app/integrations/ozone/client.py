@@ -3,7 +3,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from app.config import get_settings
-from app.integrations.ozone.auth import get_access_jwt
+from app.integrations.ozone.auth import clear_access_jwt_cache, get_access_jwt
 
 
 class OzoneAPIError(RuntimeError):
@@ -30,7 +30,7 @@ def _build_url(nsid: str) -> str:
     return f"{settings.ozone_base_url.rstrip('/')}/xrpc/{nsid}"
 
 
-def _format_http_error(exc: HTTPError, nsid: str, payload: dict | None = None) -> OzoneAPIError:
+def _extract_http_error_details(exc: HTTPError) -> tuple[str, dict | None]:
     raw_body = b""
     try:
         raw_body = exc.read()
@@ -44,6 +44,12 @@ def _format_http_error(exc: HTTPError, nsid: str, payload: dict | None = None) -
             body_json = json.loads(body_text)
         except Exception:
             body_json = None
+
+    return body_text, body_json
+
+
+def _format_http_error(exc: HTTPError, nsid: str, payload: dict | None = None) -> OzoneAPIError:
+    body_text, body_json = _extract_http_error_details(exc)
 
     parts = [f"Ozone {nsid} failed with HTTP {exc.code}"]
 
@@ -64,26 +70,46 @@ def _format_http_error(exc: HTTPError, nsid: str, payload: dict | None = None) -
     return OzoneAPIError(" | ".join(parts))
 
 
+def _is_expired_token(exc: HTTPError) -> bool:
+    _, body_json = _extract_http_error_details(exc)
+    return isinstance(body_json, dict) and body_json.get("error") == "ExpiredToken"
+
+
+def _request_json(req: Request, nsid: str, payload: dict | None = None) -> dict:
+    try:
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return json.loads(raw.decode("utf-8")) if raw else {}
+    except HTTPError as exc:
+        raise _format_http_error(exc, nsid, payload=payload) from exc
+
+
 def ozone_get(nsid: str) -> dict:
+    url = _build_url(nsid)
+
     req = Request(
-        _build_url(nsid),
+        url,
         headers=_get_headers(),
         method="GET",
     )
+
     try:
-        with urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        return _request_json(req, nsid)
+    except OzoneAPIError:
+        raise
     except HTTPError as exc:
         raise _format_http_error(exc, nsid) from exc
 
 
 def ozone_post(nsid: str, payload: dict) -> dict:
+    url = _build_url(nsid)
     body = json.dumps(payload).encode("utf-8")
+
     headers = _get_headers()
     headers["Content-Type"] = "application/json"
 
     req = Request(
-        _build_url(nsid),
+        url,
         data=body,
         headers=headers,
         method="POST",
@@ -94,6 +120,26 @@ def ozone_post(nsid: str, payload: dict) -> dict:
             raw = resp.read()
             return json.loads(raw.decode("utf-8")) if raw else {}
     except HTTPError as exc:
+        if _is_expired_token(exc):
+            clear_access_jwt_cache()
+
+            retry_headers = _get_headers()
+            retry_headers["Content-Type"] = "application/json"
+
+            retry_req = Request(
+                url,
+                data=body,
+                headers=retry_headers,
+                method="POST",
+            )
+
+            try:
+                with urlopen(retry_req, timeout=30) as resp:
+                    raw = resp.read()
+                    return json.loads(raw.decode("utf-8")) if raw else {}
+            except HTTPError as retry_exc:
+                raise _format_http_error(retry_exc, nsid, payload=payload) from retry_exc
+
         raise _format_http_error(exc, nsid, payload=payload) from exc
 
 

@@ -46,6 +46,10 @@ def get_access_jwt() -> str:
     return access_jwt
 
 
+def clear_access_jwt_cache() -> None:
+    get_access_jwt.cache_clear()
+
+
 @lru_cache(maxsize=1)
 def get_test_viewer_access_jwt() -> str | None:
     settings = get_settings()
@@ -60,3 +64,7 @@ def get_test_viewer_access_jwt() -> str | None:
     )
 
     return data.get("accessJwt")
+
+
+def clear_test_viewer_access_jwt_cache() -> None:
+    get_test_viewer_access_jwt.cache_clear()
