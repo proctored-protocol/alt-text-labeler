@@ -15,6 +15,7 @@ from app.integrations.ozone.publisher import (
 from app.parsing.posts import iter_post_creates
 from app.services.cursor import get_saved_cursor, save_cursor
 from app.services.evaluator import evaluate_post, upsert_post_evaluation
+from app.services.firehose_stats import bump_firehose_stats
 from app.services.overrides import is_uri_suppressed
 
 logger = logging.getLogger(__name__)
@@ -63,13 +64,23 @@ class FirehoseWorker:
         processed_posts = 0
 
         with SessionLocal() as session:
+            # Count every commit the worker sees.
+            bump_firehose_stats(session, commit_count=1)
+
             for post in iter_post_creates(commit):
                 try:
+                    # Count every created post the worker inspects.
+                    bump_firehose_stats(session, post_create_count=1)
+
                     if not post.image_alts:
                         continue
 
+                    # Count posts that have recognized still-image embeds.
+                    bump_firehose_stats(session, image_post_count=1)
+
                     if is_uri_suppressed(session, post.uri):
                         logger.info("post_suppressed", extra={"uri": post.uri})
+                        session.commit()
                         continue
 
                     result = evaluate_post(
@@ -80,10 +91,19 @@ class FirehoseWorker:
                     )
 
                     if result is None:
+                        session.commit()
                         continue
 
                     upsert_post_evaluation(session, result)
                     processed_posts += 1
+
+                    # Count posts that made it through evaluation/persistence.
+                    bump_firehose_stats(session, image_eval_count=1)
+
+                    if result.derived_label == self.settings.label_missing_alt:
+                        bump_firehose_stats(session, missing_label_count=1)
+                    elif result.derived_label == self.settings.label_partial_alt:
+                        bump_firehose_stats(session, partial_label_count=1)
 
                     logger.info(
                         "post_evaluated",
@@ -122,6 +142,7 @@ class FirehoseWorker:
                                     cid=result.cid,
                                     label_value=result.derived_label,
                                 )
+                                bump_firehose_stats(session, publish_success_count=1)
                                 logger.info(
                                     "label_published_via_ozone",
                                     extra={
@@ -131,6 +152,7 @@ class FirehoseWorker:
                                     },
                                 )
                             except Exception:
+                                bump_firehose_stats(session, publish_failed_count=1)
                                 logger.exception(
                                     "label_publication_failed",
                                     extra={
@@ -142,7 +164,8 @@ class FirehoseWorker:
                                     },
                                 )
 
-                    # Critical: persist evaluation rows even if publication failed.
+                    # Critical: persist evaluation rows and minute-bucket stats
+                    # even if publication failed.
                     session.commit()
 
                 except Exception:
