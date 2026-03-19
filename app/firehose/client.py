@@ -17,6 +17,7 @@ from app.services.cursor import get_saved_cursor, save_cursor
 from app.services.evaluator import evaluate_post, upsert_post_evaluation
 from app.services.firehose_stats import bump_firehose_stats
 from app.services.overrides import is_uri_suppressed
+from app.services.publish_queue import enqueue_publish_job
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class FirehoseWorker:
                 "cursor": cursor,
                 "dry_run": self.settings.firehose_dry_run,
                 "publish_via_ozone": self.settings.publish_via_ozone,
+                "publish_mode": self.settings.publish_mode,
             },
         )
 
@@ -64,18 +66,15 @@ class FirehoseWorker:
         processed_posts = 0
 
         with SessionLocal() as session:
-            # Count every commit the worker sees.
             bump_firehose_stats(session, commit_count=1)
 
             for post in iter_post_creates(commit):
                 try:
-                    # Count every created post the worker inspects.
                     bump_firehose_stats(session, post_create_count=1)
 
                     if not post.image_alts:
                         continue
 
-                    # Count posts that have recognized still-image embeds.
                     bump_firehose_stats(session, image_post_count=1)
 
                     if is_uri_suppressed(session, post.uri):
@@ -97,7 +96,6 @@ class FirehoseWorker:
                     upsert_post_evaluation(session, result)
                     processed_posts += 1
 
-                    # Count posts that made it through evaluation/persistence.
                     bump_firehose_stats(session, image_eval_count=1)
 
                     if result.derived_label == self.settings.label_missing_alt:
@@ -115,6 +113,7 @@ class FirehoseWorker:
                             "derived_label": result.derived_label,
                             "dry_run": self.settings.firehose_dry_run,
                             "publish_via_ozone": self.settings.publish_via_ozone,
+                            "publish_mode": self.settings.publish_mode,
                         },
                     )
 
@@ -134,6 +133,29 @@ class FirehoseWorker:
                                     "label_value": result.derived_label,
                                 },
                             )
+
+                        elif self.settings.publish_mode == "queue":
+                            enqueue_label_publication(
+                                session=session,
+                                uri=result.uri,
+                                cid=result.cid,
+                                label_value=result.derived_label,
+                            )
+                            enqueue_publish_job(
+                                session=session,
+                                uri=result.uri,
+                                cid=result.cid,
+                                label_value=result.derived_label,
+                            )
+                            logger.info(
+                                "label_enqueued_for_publication",
+                                extra={
+                                    "uri": result.uri,
+                                    "cid": result.cid,
+                                    "label_value": result.derived_label,
+                                },
+                            )
+
                         else:
                             try:
                                 publish_label_via_ozone(
@@ -164,8 +186,6 @@ class FirehoseWorker:
                                     },
                                 )
 
-                    # Critical: persist evaluation rows and minute-bucket stats
-                    # even if publication failed.
                     session.commit()
 
                 except Exception:

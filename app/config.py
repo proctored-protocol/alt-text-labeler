@@ -39,10 +39,22 @@ class Settings(BaseSettings):
     ozone_app_password: str | None = Field(default=None)
     publish_via_ozone: bool = Field(default=False)
 
+    publish_mode: str = Field(default="sync")
+    publisher_max_attempts: int = Field(default=10)
+    publisher_lease_seconds: int = Field(default=60)
+    publisher_batch_size: int = Field(default=25)
+    publisher_backoff_base_seconds: int = Field(default=15)
+    publisher_idle_sleep_seconds: float = Field(default=1.0)
+
     @field_validator("log_level")
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
         return value.upper().strip()
+
+    @field_validator("publish_mode")
+    @classmethod
+    def normalize_publish_mode(cls, value: str) -> str:
+        return value.lower().strip()
 
     @field_validator("firehose_cursor", mode="before")
     @classmethod
