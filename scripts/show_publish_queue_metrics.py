@@ -38,17 +38,18 @@ def main() -> None:
 
         print("\n=== pending/leased age in seconds ===")
         row = conn.execute(text("""
+            WITH s AS (
+                SELECT
+                    MIN(created_at) FILTER (WHERE state = 'pending') AS oldest_pending_created_at,
+                    MIN(created_at) FILTER (WHERE state = 'leased') AS oldest_leased_created_at,
+                    MIN(updated_at) FILTER (WHERE state = 'leased') AS oldest_leased_updated_at
+                FROM publish_job
+            )
             SELECT
-                ROUND(
-                    EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))
-                ) FILTER (WHERE state = 'pending') AS oldest_pending_age_s,
-                ROUND(
-                    EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))
-                ) FILTER (WHERE state = 'leased') AS oldest_leased_age_s,
-                ROUND(
-                    EXTRACT(EPOCH FROM (NOW() - MIN(updated_at)))
-                ) FILTER (WHERE state = 'leased') AS oldest_lease_update_age_s
-            FROM publish_job
+                ROUND(EXTRACT(EPOCH FROM (NOW() - oldest_pending_created_at))) AS oldest_pending_age_s,
+                ROUND(EXTRACT(EPOCH FROM (NOW() - oldest_leased_created_at))) AS oldest_leased_age_s,
+                ROUND(EXTRACT(EPOCH FROM (NOW() - oldest_leased_updated_at))) AS oldest_lease_update_age_s
+            FROM s
         """)).mappings().one()
         print(dict(row))
 
@@ -91,7 +92,7 @@ def main() -> None:
         for row in rows:
             print(dict(row))
 
-        print("\n=== latest pending jobs ===")
+        print("\n=== oldest pending jobs ===")
         rows = conn.execute(text("""
             SELECT
                 id, uri, cid, label_value, state, attempt_count,
@@ -104,7 +105,7 @@ def main() -> None:
         for row in rows:
             print(dict(row))
 
-        print("\n=== latest leased jobs ===")
+        print("\n=== current leased jobs ===")
         rows = conn.execute(text("""
             SELECT
                 id, uri, cid, label_value, state, attempt_count,
