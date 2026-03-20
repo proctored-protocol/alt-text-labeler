@@ -135,37 +135,28 @@ class FirehoseWorker:
                             )
 
                         elif self.settings.publish_mode == "queue":
-                            row = enqueue_label_publication(
+                            enqueue_label_publication(
                                 session=session,
                                 uri=result.uri,
                                 cid=result.cid,
                                 label_value=result.derived_label,
                             )
 
-                            if row.status != "published":
-                                enqueue_publish_job(
-                                    session=session,
-                                    uri=result.uri,
-                                    cid=result.cid,
-                                    label_value=result.derived_label,
-                                )
-                                logger.info(
-                                    "label_enqueued_for_publication",
-                                    extra={
-                                        "uri": result.uri,
-                                        "cid": result.cid,
-                                        "label_value": result.derived_label,
-                                    },
-                                )
-                            else:
-                                logger.info(
-                                    "label_already_published_skip_queue",
-                                    extra={
-                                        "uri": result.uri,
-                                        "cid": result.cid,
-                                        "label_value": result.derived_label,
-                                    },
-                                )
+                            enqueue_publish_job(
+                                session=session,
+                                uri=result.uri,
+                                cid=result.cid,
+                                label_value=result.derived_label,
+                            )
+
+                            logger.info(
+                                "label_enqueued_for_publication",
+                                extra={
+                                    "uri": result.uri,
+                                    "cid": result.cid,
+                                    "label_value": result.derived_label,
+                                },
+                            )
 
                         else:
                             try:
