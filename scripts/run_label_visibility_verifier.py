@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -116,6 +117,62 @@ def payload_has_label(*, payload: dict, uri: str, label_value: str, labeler_did:
         if label.get("val") == label_value and label.get("src") == labeler_did:
             return True
     return False
+
+
+def is_expired_token_error(exc: HTTPJSONError) -> bool:
+    if exc.code == 401:
+        return True
+
+    if exc.code != 400:
+        return False
+
+    try:
+        body = json.loads(exc.body_text)
+    except Exception:
+        return False
+
+    return isinstance(body, dict) and body.get("error") == "ExpiredToken"
+
+
+def fetch_post_thread_with_session_refresh(
+    *,
+    session_state: SessionState,
+    appview_url: str,
+    uri: str,
+    timeout: int,
+    forced_labeler_did: str | None,
+    pds_url: str,
+    handle: str,
+    app_password: str,
+) -> tuple[dict, SessionState]:
+    try:
+        payload = fetch_post_thread(
+            appview_url=appview_url,
+            uri=uri,
+            access_jwt=session_state.access_jwt,
+            timeout=timeout,
+            forced_labeler_did=forced_labeler_did,
+        )
+        return payload, session_state
+    except HTTPJSONError as exc:
+        if not is_expired_token_error(exc):
+            raise
+
+        refreshed = create_session(
+            pds_url=pds_url,
+            handle=handle,
+            app_password=app_password,
+            timeout=timeout,
+        )
+
+        payload = fetch_post_thread(
+            appview_url=appview_url,
+            uri=uri,
+            access_jwt=refreshed.access_jwt,
+            timeout=timeout,
+            forced_labeler_did=forced_labeler_did,
+        )
+        return payload, refreshed
 
 
 def seed_visibility_rows(*, lookback_hours: int, label_missing_alt: str, label_partial_alt: str) -> int:
@@ -290,7 +347,6 @@ def main() -> None:
 
             if not candidates:
                 logger.info("label_visibility_no_candidates")
-                import time
                 time.sleep(verifier_settings.verifier_sleep_seconds)
                 continue
 
@@ -306,12 +362,15 @@ def main() -> None:
                     visible = False
                     error_text = None
                     try:
-                        payload = fetch_post_thread(
+                        payload, session_state = fetch_post_thread_with_session_refresh(
+                            session_state=session_state,
                             appview_url=verifier_settings.verifier_appview_url,
                             uri=uri,
-                            access_jwt=session_state.access_jwt,
                             timeout=verifier_settings.verifier_request_timeout_seconds,
                             forced_labeler_did=verifier_settings.verifier_labeler_did,
+                            pds_url=app_settings.bsky_pds_url,
+                            handle=app_settings.test_viewer_handle,
+                            app_password=app_settings.test_viewer_app_password,
                         )
                         visible = payload_has_label(
                             payload=payload,
@@ -321,13 +380,6 @@ def main() -> None:
                         )
                     except HTTPJSONError as exc:
                         error_text = f"{exc.code}: {exc.body_text}"
-                        if exc.code == 401:
-                            session_state = create_session(
-                                pds_url=app_settings.bsky_pds_url,
-                                handle=app_settings.test_viewer_handle,
-                                app_password=app_settings.test_viewer_app_password,
-                                timeout=verifier_settings.verifier_request_timeout_seconds,
-                            )
                     except Exception as exc:
                         error_text = str(exc)
 
@@ -345,12 +397,15 @@ def main() -> None:
                     visible = False
                     error_text = None
                     try:
-                        payload = fetch_post_thread(
+                        payload, session_state = fetch_post_thread_with_session_refresh(
+                            session_state=session_state,
                             appview_url=verifier_settings.verifier_appview_url,
                             uri=uri,
-                            access_jwt=session_state.access_jwt,
                             timeout=verifier_settings.verifier_request_timeout_seconds,
                             forced_labeler_did=None,
+                            pds_url=app_settings.bsky_pds_url,
+                            handle=app_settings.test_viewer_handle,
+                            app_password=app_settings.test_viewer_app_password,
                         )
                         visible = payload_has_label(
                             payload=payload,
@@ -360,13 +415,6 @@ def main() -> None:
                         )
                     except HTTPJSONError as exc:
                         error_text = f"{exc.code}: {exc.body_text}"
-                        if exc.code == 401:
-                            session_state = create_session(
-                                pds_url=app_settings.bsky_pds_url,
-                                handle=app_settings.test_viewer_handle,
-                                app_password=app_settings.test_viewer_app_password,
-                                timeout=verifier_settings.verifier_request_timeout_seconds,
-                            )
                     except Exception as exc:
                         error_text = str(exc)
 
@@ -392,7 +440,6 @@ def main() -> None:
         except Exception:
             logger.exception("label_visibility_verifier_loop_failed")
 
-        import time
         time.sleep(verifier_settings.verifier_sleep_seconds)
 
 
