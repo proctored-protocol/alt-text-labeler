@@ -6,7 +6,7 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -14,6 +14,9 @@ from urllib.error import HTTPError
 from app.config import get_settings
 from app.integrations.ozone.auth import clear_test_viewer_access_jwt_cache, get_test_viewer_access_jwt
 from app.integrations.ozone.client import ozone_post
+
+
+PUBLIC_API_BASE_URL = "https://public.api.bsky.app"
 
 
 def utc_now() -> datetime:
@@ -113,9 +116,8 @@ def resolve_profile_token_to_did(profile_token: str, *, timeout: int) -> str:
     if profile_token.startswith("did:"):
         return profile_token
 
-    settings = get_settings()
     params = urlencode({"handle": profile_token})
-    url = f"{settings.bsky_pds_url.rstrip('/')}/xrpc/com.atproto.identity.resolveHandle?{params}"
+    url = f"{PUBLIC_API_BASE_URL}/xrpc/com.atproto.identity.resolveHandle?{params}"
     _status, _headers, payload = http_json(url, timeout=timeout)
     did = payload.get("did")
     if not did:
@@ -124,9 +126,8 @@ def resolve_profile_token_to_did(profile_token: str, *, timeout: int) -> str:
 
 
 def fetch_post_cid(at_uri: str, *, timeout: int) -> str:
-    settings = get_settings()
     params = urlencode([("uris", at_uri)])
-    url = f"{settings.bsky_pds_url.rstrip('/')}/xrpc/app.bsky.feed.getPosts?{params}"
+    url = f"{PUBLIC_API_BASE_URL}/xrpc/app.bsky.feed.getPosts?{params}"
     _status, _headers, payload = http_json(url, timeout=timeout)
     posts = payload.get("posts") or []
     if not posts:
@@ -213,7 +214,7 @@ def query_labels(*, at_uri: str, labeler_did: str, timeout: int) -> VisibilityRe
             ("limit", "20"),
         ]
     )
-    url = f"https://public.api.bsky.app/xrpc/com.atproto.label.queryLabels?{params}"
+    url = f"{PUBLIC_API_BASE_URL}/xrpc/com.atproto.label.queryLabels?{params}"
 
     try:
         status, headers, payload = http_json(url, timeout=timeout)
@@ -366,7 +367,6 @@ def verification_succeeded(
 ) -> bool:
     forced_ok = True if not require_forced else snapshot.forced_hydration.found_label
     subscriber_ok = True if not require_subscriber else snapshot.subscriber_hydration.found_label
-
     return snapshot.query_labels.found_label and forced_ok and subscriber_ok
 
 
@@ -474,7 +474,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    settings = get_settings()
     labeler_did = created_by_did()
 
     started_at = time.monotonic()
@@ -490,7 +489,6 @@ def main() -> None:
 
     attempts: list[dict[str, Any]] = []
     deadline = time.monotonic() + args.verify_timeout_seconds
-    final_snapshot: VerificationSnapshot | None = None
 
     attempt_no = 0
     while True:
@@ -503,8 +501,6 @@ def main() -> None:
             skip_forced_check=args.skip_forced_check,
             skip_subscriber_check=args.skip_subscriber_check,
         )
-        final_snapshot = snapshot
-
         attempt_entry = {
             "attempt": attempt_no,
             "checked_at": iso_now(),
