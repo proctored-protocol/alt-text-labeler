@@ -11,12 +11,27 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from app.config import get_settings
 from app.integrations.ozone.auth import clear_test_viewer_access_jwt_cache, get_test_viewer_access_jwt
 from app.integrations.ozone.client import ozone_post
 
 
 PUBLIC_API_BASE_URL = "https://public.api.bsky.app"
+
+
+class ScriptSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    verifier_labeler_did: str = Field(...)
+    verifier_appview_url: str = Field(default="https://bsky.social")
 
 
 def utc_now() -> datetime:
@@ -250,7 +265,7 @@ def get_post_thread_visibility(
     timeout: int,
     forced: bool,
 ) -> VisibilityResult:
-    settings = get_settings()
+    script_settings = ScriptSettings()
     params = urlencode(
         [
             ("uri", at_uri),
@@ -258,7 +273,7 @@ def get_post_thread_visibility(
             ("parentHeight", "0"),
         ]
     )
-    url = f"{settings.verifier_appview_url.rstrip('/')}/xrpc/app.bsky.feed.getPostThread?{params}"
+    url = f"{script_settings.verifier_appview_url.rstrip('/')}/xrpc/app.bsky.feed.getPostThread?{params}"
 
     token = get_viewer_access_jwt(force_refresh=False)
     headers = {
@@ -474,7 +489,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    labeler_did = created_by_did()
+    script_settings = ScriptSettings()
+    labeler_did = script_settings.verifier_labeler_did
 
     started_at = time.monotonic()
     resolved = resolve_post(args.post_url, timeout=args.request_timeout_seconds)
