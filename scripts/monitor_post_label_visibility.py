@@ -244,45 +244,27 @@ def get_post_thread_visibility(
 
     headers = {"Accept": "application/json"}
 
+    token = get_viewer_access_jwt(force_refresh=False)
+    headers["Authorization"] = f"Bearer {token}"
     if forced:
-        token = get_viewer_access_jwt(force_refresh=False)
-        headers["Authorization"] = f"Bearer {token}"
         headers["atproto-accept-labelers"] = labeler_did
-        try:
+
+    try:
+        status, resp_headers, payload = http_json(url, headers=headers, timeout=timeout)
+    except HTTPJSONError as exc:
+        if is_expired_token_error(exc):
+            token = get_viewer_access_jwt(force_refresh=True)
+            headers["Authorization"] = f"Bearer {token}"
             status, resp_headers, payload = http_json(url, headers=headers, timeout=timeout)
-        except HTTPJSONError as exc:
-            if is_expired_token_error(exc):
-                token = get_viewer_access_jwt(force_refresh=True)
-                headers["Authorization"] = f"Bearer {token}"
-                status, resp_headers, payload = http_json(url, headers=headers, timeout=timeout)
-            else:
-                return VisibilityResult(
-                    ok=False,
-                    status_code=exc.code,
-                    found_label=False,
-                    response_headers={},
-                    payload=exc.payload,
-                    error_text=f"{exc.code}: {exc.body_text}",
-                )
-    else:
-        token = get_viewer_access_jwt(force_refresh=False)
-        headers["Authorization"] = f"Bearer {token}"
-        try:
-            status, resp_headers, payload = http_json(url, headers=headers, timeout=timeout)
-        except HTTPJSONError as exc:
-            if is_expired_token_error(exc):
-                token = get_viewer_access_jwt(force_refresh=True)
-                headers["Authorization"] = f"Bearer {token}"
-                status, resp_headers, payload = http_json(url, headers=headers, timeout=timeout)
-            else:
-                return VisibilityResult(
-                    ok=False,
-                    status_code=exc.code,
-                    found_label=False,
-                    response_headers={},
-                    payload=exc.payload,
-                    error_text=f"{exc.code}: {exc.body_text}",
-                )
+        else:
+            return VisibilityResult(
+                ok=False,
+                status_code=exc.code,
+                found_label=False,
+                response_headers={},
+                payload=exc.payload,
+                error_text=f"{exc.code}: {exc.body_text}",
+            )
 
     thread = payload.get("thread") or {}
     post = thread.get("post") or {}
@@ -389,7 +371,11 @@ def success(snapshot: VerificationSnapshot, *, require_forced: bool, require_sub
     return snapshot.query_labels.found_label and forced_ok and subscriber_ok
 
 
-def print_json(data: Any) -> None:
+def print_json_line(data: Any) -> None:
+    print(json.dumps(data, ensure_ascii=False, default=str), flush=True)
+
+
+def print_json_pretty(data: Any) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
@@ -412,7 +398,7 @@ def print_summary(
     print(f"total_seconds:  {round(total_seconds, 2)}")
     print()
     print("verification_attempts:")
-    print_json(attempts)
+    print_json_pretty(attempts)
 
 
 def main() -> None:
@@ -487,13 +473,25 @@ def main() -> None:
             skip_subscriber_check=args.skip_subscriber_check,
         )
 
-        attempts.append(
-            {
-                "attempt": attempt_no,
-                "checked_at": iso_now(),
-                "summary": summarize_snapshot(snapshot),
-            }
-        )
+        attempt_entry = {
+            "attempt": attempt_no,
+            "checked_at": iso_now(),
+            "elapsed_seconds": round(time.monotonic() - started_at, 2),
+            "summary": summarize_snapshot(snapshot),
+        }
+        attempts.append(attempt_entry)
+
+        progress_event = {
+            "event": "monitor_progress",
+            "post_url": resolved.post_url,
+            "at_uri": resolved.at_uri,
+            "label_value": args.label_value,
+            "attempt": attempt_no,
+            "checked_at": attempt_entry["checked_at"],
+            "elapsed_seconds": attempt_entry["elapsed_seconds"],
+            "summary": attempt_entry["summary"],
+        }
+        print_json_line(progress_event)
 
         if success(snapshot, require_forced=require_forced, require_subscriber=require_subscriber):
             total_seconds = time.monotonic() - started_at
@@ -505,7 +503,7 @@ def main() -> None:
                 "total_seconds": round(total_seconds, 2),
             }
             if args.json:
-                print_json(result)
+                print_json_pretty(result)
             else:
                 print_summary(
                     resolved=resolved,
@@ -529,7 +527,7 @@ def main() -> None:
         "total_seconds": round(total_seconds, 2),
     }
     if args.json:
-        print_json(result)
+        print_json_pretty(result)
     else:
         print_summary(
             resolved=resolved,
@@ -545,5 +543,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         raise
