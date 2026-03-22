@@ -63,6 +63,7 @@ def ensure_db(conn: sqlite3.Connection) -> None:
             final_query_found_label INTEGER,
             final_subscriber_found_label INTEGER,
             manual_success INTEGER,
+            processing_error TEXT,
             raw_result_json TEXT,
             processed_at TEXT
         )
@@ -99,7 +100,7 @@ def already_processed(conn: sqlite3.Connection, uri: str) -> bool:
     return row is not None
 
 
-def save_result(
+def save_success_result(
     conn: sqlite3.Connection,
     *,
     candidate: Candidate,
@@ -169,9 +170,10 @@ def save_result(
             final_query_found_label,
             final_subscriber_found_label,
             manual_success,
+            processing_error,
             raw_result_json,
             processed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             candidate.uri,
@@ -191,7 +193,66 @@ def save_result(
             final_query_found_label,
             final_subscriber_found_label,
             1 if result.get("success") is True else 0,
+            None,
             json.dumps(result, ensure_ascii=False, default=str),
+            iso_now(),
+        ),
+    )
+    conn.commit()
+
+
+def save_error_result(
+    conn: sqlite3.Connection,
+    *,
+    candidate: Candidate,
+    post_url: str,
+    error_text: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO experiment_posts (
+            uri,
+            cid,
+            post_url,
+            label_value,
+            record_created_at,
+            evaluated_at,
+            ozone_event_id,
+            ozone_created_at,
+            first_forced_true_at,
+            first_query_true_at,
+            final_forced_status_code,
+            final_query_status_code,
+            final_subscriber_status_code,
+            final_forced_found_label,
+            final_query_found_label,
+            final_subscriber_found_label,
+            manual_success,
+            processing_error,
+            raw_result_json,
+            processed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate.uri,
+            candidate.cid,
+            post_url,
+            candidate.label_value,
+            candidate.record_created_at,
+            candidate.evaluated_at,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            error_text,
+            None,
             iso_now(),
         ),
     )
@@ -369,41 +430,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="40-minute labeler validity experiment: reset labeler record, run intake only, publish via existing manual script."
     )
-    parser.add_argument(
-        "--duration-minutes",
-        type=int,
-        default=40,
-        help="Experiment duration in minutes.",
-    )
-    parser.add_argument(
-        "--candidate-interval-seconds",
-        type=int,
-        default=10,
-        help="Minimum spacing between processed candidates.",
-    )
-    parser.add_argument(
-        "--manual-verify-timeout-seconds",
-        type=int,
-        default=10,
-        help="verify-timeout-seconds passed to manual_publish_and_verify.py",
-    )
-    parser.add_argument(
-        "--manual-verify-interval-seconds",
-        type=int,
-        default=1,
-        help="verify-interval-seconds passed to manual_publish_and_verify.py",
-    )
-    parser.add_argument(
-        "--poll-seconds",
-        type=float,
-        default=1.0,
-        help="DB polling interval while waiting for next candidate.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="experiment_runs",
-        help="Directory for sqlite DB and intake logs.",
-    )
+    parser.add_argument("--duration-minutes", type=int, default=40)
+    parser.add_argument("--candidate-interval-seconds", type=int, default=10)
+    parser.add_argument("--manual-verify-timeout-seconds", type=int, default=10)
+    parser.add_argument("--manual-verify-interval-seconds", type=int, default=1)
+    parser.add_argument("--poll-seconds", type=float, default=1.0)
+    parser.add_argument("--output-dir", default="experiment_runs")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -487,7 +519,28 @@ def main() -> None:
                 time.sleep(args.poll_seconds)
                 continue
 
-            post_url = uri_to_post_url(candidate.uri)
+            try:
+                post_url = uri_to_post_url(candidate.uri)
+            except Exception as exc:
+                error_text = f"uri_to_post_url failed: {exc}"
+                save_error_result(
+                    conn,
+                    candidate=candidate,
+                    post_url="",
+                    error_text=error_text,
+                )
+                print_json_line(
+                    {
+                        "event": "candidate_failed",
+                        "checked_at": iso_now(),
+                        "post_uri": candidate.uri,
+                        "post_cid": candidate.cid,
+                        "label_value": candidate.label_value,
+                        "error": error_text,
+                    }
+                )
+                next_allowed_processing_at = time.monotonic() + args.candidate_interval_seconds
+                continue
 
             print_json_line(
                 {
@@ -516,36 +569,56 @@ def main() -> None:
                 "--json",
             ]
 
-            result = run_subprocess_json(
-                cmd,
-                timeout_seconds=max(args.manual_verify_timeout_seconds + 30, 60),
-            )
+            try:
+                result = run_subprocess_json(
+                    cmd,
+                    timeout_seconds=max(args.manual_verify_timeout_seconds + 30, 60),
+                )
+                save_success_result(
+                    conn,
+                    candidate=candidate,
+                    post_url=post_url,
+                    result=result,
+                )
 
-            save_result(
-                conn,
-                candidate=candidate,
-                post_url=post_url,
-                result=result,
-            )
+                attempts = result.get("verification_attempts") or []
+                final_summary = attempts[-1]["summary"] if attempts else {}
 
-            attempts = result.get("verification_attempts") or []
-            final_summary = attempts[-1]["summary"] if attempts else {}
-
-            print_json_line(
-                {
-                    "event": "candidate_processed",
-                    "checked_at": iso_now(),
-                    "post_url": post_url,
-                    "post_uri": candidate.uri,
-                    "post_cid": candidate.cid,
-                    "label_value": candidate.label_value,
-                    "record_created_at": candidate.record_created_at,
-                    "ozone_event_id": (result.get("ozone_response") or {}).get("id"),
-                    "ozone_created_at": (result.get("ozone_response") or {}).get("createdAt"),
-                    "manual_success": result.get("success"),
-                    "final_summary": final_summary,
-                }
-            )
+                print_json_line(
+                    {
+                        "event": "candidate_processed",
+                        "checked_at": iso_now(),
+                        "post_url": post_url,
+                        "post_uri": candidate.uri,
+                        "post_cid": candidate.cid,
+                        "label_value": candidate.label_value,
+                        "record_created_at": candidate.record_created_at,
+                        "ozone_event_id": (result.get("ozone_response") or {}).get("id"),
+                        "ozone_created_at": (result.get("ozone_response") or {}).get("createdAt"),
+                        "manual_success": result.get("success"),
+                        "final_summary": final_summary,
+                    }
+                )
+            except Exception as exc:
+                error_text = str(exc)
+                save_error_result(
+                    conn,
+                    candidate=candidate,
+                    post_url=post_url,
+                    error_text=error_text,
+                )
+                print_json_line(
+                    {
+                        "event": "candidate_failed",
+                        "checked_at": iso_now(),
+                        "post_url": post_url,
+                        "post_uri": candidate.uri,
+                        "post_cid": candidate.cid,
+                        "label_value": candidate.label_value,
+                        "record_created_at": candidate.record_created_at,
+                        "error": error_text,
+                    }
+                )
 
             next_allowed_processing_at = time.monotonic() + args.candidate_interval_seconds
 
