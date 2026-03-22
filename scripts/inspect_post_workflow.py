@@ -64,6 +64,47 @@ def resolve_post(post_url: str, *, timeout: int) -> tuple[str, str | None]:
     return at_uri, cid
 
 
+def choose_order_by(columns: list[str]) -> str | None:
+    preferred = [
+        "published_at",
+        "updated_at",
+        "created_at",
+        "record_created_at",
+        "checked_at",
+        "last_forced_checked_at",
+        "last_subscriber_checked_at",
+        "id",
+        "cid",
+    ]
+    for col in preferred:
+        if col in columns:
+            return col
+    return None
+
+
+def fetch_table_rows(
+    *,
+    conn,
+    table_name: str,
+    columns: list[str],
+    where_sql: str,
+    params: dict[str, Any],
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    order_by = choose_order_by(columns)
+
+    sql = f"SELECT * FROM {table_name} WHERE {where_sql}"
+    if order_by is not None:
+        sql += f" ORDER BY {order_by} DESC"
+    sql += " LIMIT :limit"
+
+    query_params = dict(params)
+    query_params["limit"] = limit
+
+    result = conn.execute(text(sql), query_params).mappings()
+    return [dict(r) for r in result]
+
+
 def fetch_rows_for_uri(uri: str) -> dict[str, Any]:
     inspector = inspect(engine)
     tables = inspector.get_table_names()
@@ -78,13 +119,15 @@ def fetch_rows_for_uri(uri: str) -> dict[str, Any]:
     with engine.connect() as conn:
         if "label_publication" in tables:
             cols = [c["name"] for c in inspector.get_columns("label_publication")]
-            rows = []
+            rows: list[dict[str, Any]] = []
             if "uri" in cols:
-                result = conn.execute(
-                    text("SELECT * FROM label_publication WHERE uri = :uri ORDER BY id DESC LIMIT 100"),
-                    {"uri": uri},
-                ).mappings()
-                rows = [dict(r) for r in result]
+                rows = fetch_table_rows(
+                    conn=conn,
+                    table_name="label_publication",
+                    columns=cols,
+                    where_sql="uri = :uri",
+                    params={"uri": uri},
+                )
                 if "id" in cols:
                     publication_ids = [r["id"] for r in rows if isinstance(r.get("id"), int)]
             output["tables"]["label_publication"] = {
@@ -94,13 +137,15 @@ def fetch_rows_for_uri(uri: str) -> dict[str, Any]:
 
         if "post_evaluation" in tables:
             cols = [c["name"] for c in inspector.get_columns("post_evaluation")]
-            rows = []
+            rows: list[dict[str, Any]] = []
             if "uri" in cols:
-                result = conn.execute(
-                    text("SELECT * FROM post_evaluation WHERE uri = :uri ORDER BY id DESC LIMIT 100"),
-                    {"uri": uri},
-                ).mappings()
-                rows = [dict(r) for r in result]
+                rows = fetch_table_rows(
+                    conn=conn,
+                    table_name="post_evaluation",
+                    columns=cols,
+                    where_sql="uri = :uri",
+                    params={"uri": uri},
+                )
             output["tables"]["post_evaluation"] = {
                 "columns": cols,
                 "rows": rows,
@@ -108,13 +153,15 @@ def fetch_rows_for_uri(uri: str) -> dict[str, Any]:
 
         if "label_visibility" in tables:
             cols = [c["name"] for c in inspector.get_columns("label_visibility")]
-            rows = []
+            rows: list[dict[str, Any]] = []
             if "uri" in cols:
-                result = conn.execute(
-                    text("SELECT * FROM label_visibility WHERE uri = :uri ORDER BY id DESC LIMIT 100"),
-                    {"uri": uri},
-                ).mappings()
-                rows = [dict(r) for r in result]
+                rows = fetch_table_rows(
+                    conn=conn,
+                    table_name="label_visibility",
+                    columns=cols,
+                    where_sql="uri = :uri",
+                    params={"uri": uri},
+                )
             output["tables"]["label_visibility"] = {
                 "columns": cols,
                 "rows": rows,
@@ -122,13 +169,20 @@ def fetch_rows_for_uri(uri: str) -> dict[str, Any]:
 
         if "publish_job" in tables:
             cols = [c["name"] for c in inspector.get_columns("publish_job")]
-            rows = []
+            rows: list[dict[str, Any]] = []
             if "publication_id" in cols and publication_ids:
+                sql = "SELECT * FROM publish_job WHERE publication_id = ANY(:publication_ids)"
+                order_by = choose_order_by(cols)
+                if order_by is not None:
+                    sql += f" ORDER BY {order_by} DESC"
+                sql += " LIMIT :limit"
+
                 result = conn.execute(
-                    text("SELECT * FROM publish_job WHERE publication_id = ANY(:publication_ids) ORDER BY id DESC LIMIT 100"),
-                    {"publication_ids": publication_ids},
+                    text(sql),
+                    {"publication_ids": publication_ids, "limit": 100},
                 ).mappings()
                 rows = [dict(r) for r in result]
+
             output["tables"]["publish_job"] = {
                 "columns": cols,
                 "rows": rows,
