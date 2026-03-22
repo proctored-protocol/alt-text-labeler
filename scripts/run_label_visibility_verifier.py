@@ -57,7 +57,7 @@ def http_json(method: str, url: str, *, payload=None, headers=None, timeout: int
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
+            return json.loads(raw) if raw else {}, dict(resp.headers.items())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise HTTPJSONError(exc.code, body) from exc
@@ -68,7 +68,7 @@ def create_session(*, pds_url: str, handle: str, app_password: str, timeout: int
         "identifier": handle,
         "password": app_password,
     }
-    data = http_json(
+    data, _ = http_json(
         "POST",
         f"{pds_url.rstrip('/')}/xrpc/com.atproto.server.createSession",
         payload=payload,
@@ -96,7 +96,7 @@ def fetch_post_thread(
         "Authorization": f"Bearer {access_jwt}",
     }
     if forced_labeler_did:
-        headers["atproto-content-labelers"] = forced_labeler_did
+        headers["atproto-accept-labelers"] = forced_labeler_did
 
     return http_json(
         "GET",
@@ -144,16 +144,16 @@ def fetch_post_thread_with_session_refresh(
     pds_url: str,
     handle: str,
     app_password: str,
-) -> tuple[dict, SessionState]:
+) -> tuple[dict, dict[str, str], SessionState]:
     try:
-        payload = fetch_post_thread(
+        payload, headers = fetch_post_thread(
             appview_url=appview_url,
             uri=uri,
             access_jwt=session_state.access_jwt,
             timeout=timeout,
             forced_labeler_did=forced_labeler_did,
         )
-        return payload, session_state
+        return payload, headers, session_state
     except HTTPJSONError as exc:
         if not is_expired_token_error(exc):
             raise
@@ -165,14 +165,14 @@ def fetch_post_thread_with_session_refresh(
             timeout=timeout,
         )
 
-        payload = fetch_post_thread(
+        payload, headers = fetch_post_thread(
             appview_url=appview_url,
             uri=uri,
             access_jwt=refreshed.access_jwt,
             timeout=timeout,
             forced_labeler_did=forced_labeler_did,
         )
-        return payload, refreshed
+        return payload, headers, refreshed
 
 
 def seed_visibility_rows(*, lookback_hours: int, label_missing_alt: str, label_partial_alt: str) -> int:
@@ -362,7 +362,7 @@ def main() -> None:
                     visible = False
                     error_text = None
                     try:
-                        payload, session_state = fetch_post_thread_with_session_refresh(
+                        payload, _headers, session_state = fetch_post_thread_with_session_refresh(
                             session_state=session_state,
                             appview_url=verifier_settings.verifier_appview_url,
                             uri=uri,
@@ -397,7 +397,7 @@ def main() -> None:
                     visible = False
                     error_text = None
                     try:
-                        payload, session_state = fetch_post_thread_with_session_refresh(
+                        payload, _headers, session_state = fetch_post_thread_with_session_refresh(
                             session_state=session_state,
                             appview_url=verifier_settings.verifier_appview_url,
                             uri=uri,
