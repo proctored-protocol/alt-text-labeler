@@ -1,4 +1,5 @@
 import logging
+import time
 
 from atproto import (
     FirehoseSubscribeReposClient,
@@ -25,7 +26,20 @@ logger = logging.getLogger(__name__)
 class FirehoseWorker:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.client = None
 
+        logger.info(
+            "firehose_worker_initialized",
+            extra={
+                "base_uri": self.settings.firehose_base_uri,
+                "configured_cursor": self.settings.firehose_cursor,
+                "dry_run": self.settings.firehose_dry_run,
+                "publish_via_ozone": self.settings.publish_via_ozone,
+                "publish_mode": self.settings.publish_mode,
+            },
+        )
+
+    def _build_client(self) -> FirehoseSubscribeReposClient:
         cursor = self.settings.firehose_cursor
         with SessionLocal() as session:
             if cursor is None:
@@ -33,25 +47,49 @@ class FirehoseWorker:
 
         params = {"cursor": cursor} if cursor is not None else None
 
-        self.client = FirehoseSubscribeReposClient(
+        logger.info(
+            "firehose_client_building",
+            extra={
+                "base_uri": self.settings.firehose_base_uri,
+                "cursor": cursor,
+            },
+        )
+
+        return FirehoseSubscribeReposClient(
             params=params,
             base_uri=self.settings.firehose_base_uri,
         )
 
-        logger.info(
-            "firehose_worker_initialized",
-            extra={
-                "base_uri": self.settings.firehose_base_uri,
-                "cursor": cursor,
-                "dry_run": self.settings.firehose_dry_run,
-                "publish_via_ozone": self.settings.publish_via_ozone,
-                "publish_mode": self.settings.publish_mode,
-            },
-        )
-
     def run(self) -> None:
         logger.info("firehose_worker_starting")
-        self.client.start(self.on_message, self.on_callback_error)
+
+        reconnect_delay_seconds = 2.0
+
+        while True:
+            try:
+                self.client = self._build_client()
+                self.client.start(self.on_message, self.on_callback_error)
+
+                logger.warning(
+                    "firehose_client_stopped_reconnecting",
+                    extra={"reconnect_delay_seconds": reconnect_delay_seconds},
+                )
+                time.sleep(reconnect_delay_seconds)
+
+            except Exception as exc:
+                error_text = str(exc)
+
+                if "ConsumerTooSlow" in error_text:
+                    logger.warning(
+                        "firehose_consumer_too_slow_reconnecting",
+                        extra={"reconnect_delay_seconds": reconnect_delay_seconds},
+                    )
+                    time.sleep(reconnect_delay_seconds)
+                    continue
+
+                logger.exception("firehose_worker_crashed_reconnecting")
+                time.sleep(reconnect_delay_seconds)
+                continue
 
     def on_callback_error(self, exc: BaseException) -> None:
         logger.exception("firehose_callback_error", exc_info=exc)
