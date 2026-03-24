@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 def normalize_alt_text(value: str | None) -> str | None:
     if value is None:
         return None

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from app.rules.alt_text import is_usable_alt_text
 
 
