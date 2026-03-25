@@ -62,4 +62,8 @@ def upsert_post_evaluation(session: Session, result: EvaluationResult) -> PostEv
     row.record_created_at = result.record_created_at
     row.raw_embed_type = result.raw_embed_type
     row.last_seen_seq = result.last_seen_seq
+
+    from sqlalchemy import func
+    row.evaluated_at = func.now()
+
     return row
