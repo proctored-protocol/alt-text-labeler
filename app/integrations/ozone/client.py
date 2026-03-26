@@ -1,23 +1,29 @@
+from __future__ import annotations
+
 import json
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from app.config import get_settings
-from app.integrations.ozone.auth import clear_access_jwt_cache, get_access_jwt
+from app.integrations.ozone.auth import (
+    OzoneAuthError,
+    clear_access_jwt_cache,
+    get_access_jwt,
+)
 
 
 class OzoneAPIError(RuntimeError):
     pass
 
 
-def _get_headers() -> dict[str, str]:
+def _get_headers(*, force_refresh: bool = False) -> dict[str, str]:
     settings = get_settings()
 
     if not settings.ozone_proxy_did:
         raise RuntimeError("OZONE_PROXY_DID must be set in .env")
 
     return {
-        "Authorization": f"Bearer {get_access_jwt()}",
+        "Authorization": f"Bearer {get_access_jwt(force_refresh=force_refresh)}",
         "atproto-proxy": settings.ozone_proxy_did,
         "Accept": "application/json",
     }
@@ -71,59 +77,72 @@ def _format_http_error(exc: HTTPError, nsid: str, payload: dict | None = None) -
 
 
 def _is_expired_token(exc: HTTPError) -> bool:
+    if exc.code == 401:
+        return True
+
     _, body_json = _extract_http_error_details(exc)
     return isinstance(body_json, dict) and body_json.get("error") == "ExpiredToken"
-
-
-def _request_json(req: Request, nsid: str, payload: dict | None = None) -> dict:
-    try:
-        with urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            return json.loads(raw.decode("utf-8")) if raw else {}
-    except HTTPError as exc:
-        raise _format_http_error(exc, nsid, payload=payload) from exc
 
 
 def ozone_get(nsid: str) -> dict:
     url = _build_url(nsid)
 
-    req = Request(
-        url,
-        headers=_get_headers(),
-        method="GET",
-    )
-
     try:
-        return _request_json(req, nsid)
-    except OzoneAPIError:
-        raise
+        req = Request(
+            url,
+            headers=_get_headers(force_refresh=False),
+            method="GET",
+        )
+
+        with urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return json.loads(raw.decode("utf-8")) if raw else {}
+
     except HTTPError as exc:
+        if _is_expired_token(exc):
+            clear_access_jwt_cache()
+
+            retry_req = Request(
+                url,
+                headers=_get_headers(force_refresh=True),
+                method="GET",
+            )
+            try:
+                with urlopen(retry_req, timeout=30) as resp:
+                    raw = resp.read()
+                    return json.loads(raw.decode("utf-8")) if raw else {}
+            except HTTPError as retry_exc:
+                raise _format_http_error(retry_exc, nsid) from retry_exc
+
         raise _format_http_error(exc, nsid) from exc
+    except OzoneAuthError:
+        raise
 
 
 def ozone_post(nsid: str, payload: dict) -> dict:
     url = _build_url(nsid)
     body = json.dumps(payload).encode("utf-8")
 
-    headers = _get_headers()
-    headers["Content-Type"] = "application/json"
-
-    req = Request(
-        url,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-
     try:
+        headers = _get_headers(force_refresh=False)
+        headers["Content-Type"] = "application/json"
+
+        req = Request(
+            url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+
         with urlopen(req, timeout=30) as resp:
             raw = resp.read()
             return json.loads(raw.decode("utf-8")) if raw else {}
+
     except HTTPError as exc:
         if _is_expired_token(exc):
             clear_access_jwt_cache()
 
-            retry_headers = _get_headers()
+            retry_headers = _get_headers(force_refresh=True)
             retry_headers["Content-Type"] = "application/json"
 
             retry_req = Request(
@@ -141,6 +160,8 @@ def ozone_post(nsid: str, payload: dict) -> dict:
                 raise _format_http_error(retry_exc, nsid, payload=payload) from retry_exc
 
         raise _format_http_error(exc, nsid, payload=payload) from exc
+    except OzoneAuthError:
+        raise
 
 
 def get_server_config() -> dict:

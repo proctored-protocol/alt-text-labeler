@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-import urllib.parse
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,9 +10,6 @@ from sqlalchemy import text
 
 from app.db import SessionLocal, engine, init_db
 from app.services.label_work_queue import enqueue_label_work_item
-
-
-PUBLIC_API_BASE_URL = "https://public.api.bsky.app"
 
 
 def utc_now() -> datetime:
@@ -27,20 +22,6 @@ def iso_now() -> str:
 
 def print_json_line(data: dict[str, Any]) -> None:
     print(json.dumps(data, ensure_ascii=False, default=str), flush=True)
-
-
-def resolve_did_to_handle(did: str) -> str:
-    url = (
-        f"{PUBLIC_API_BASE_URL}/xrpc/app.bsky.actor.getProfile?"
-        + urllib.parse.urlencode({"actor": did})
-    )
-    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    handle = payload.get("handle")
-    if not handle:
-        raise RuntimeError(f"Could not resolve DID to handle: {did}")
-    return handle
 
 
 def uri_to_post_url(uri: str) -> str:
@@ -57,8 +38,7 @@ def uri_to_post_url(uri: str) -> str:
     if collection != "app.bsky.feed.post":
         raise ValueError(f"Unexpected collection in URI: {uri}")
 
-    handle = resolve_did_to_handle(did)
-    return f"https://bsky.app/profile/{handle}/post/{rkey}"
+    return f"https://bsky.app/profile/{did}/post/{rkey}"
 
 
 def fetch_unqueued_candidates(*, batch_size: int, lookback_hours: int) -> list[dict[str, Any]]:
