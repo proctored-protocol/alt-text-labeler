@@ -10,12 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.db import SessionLocal, init_db
-from app.services.label_work_queue import (
-    lease_label_work_items,
-    mark_label_work_item_dead,
-    mark_label_work_item_retry,
-    mark_label_work_item_visible,
+from sqlalchemy import text
+
+from app.db import SessionLocal
+from app.services.publish_queue import (
+    lease_publish_jobs,
+    mark_publish_job_dead,
+    mark_publish_job_published,
+    mark_publish_job_retry,
     next_backoff_seconds,
 )
 
@@ -32,8 +34,19 @@ def print_json_line(data: dict[str, Any]) -> None:
     print(json.dumps(data, ensure_ascii=False, default=str), flush=True)
 
 
-def run_subprocess_json(cmd: list[str], *, timeout_seconds: int) -> tuple[int, dict[str, Any] | None, str, str]:
-    completed = subprocess.run(
+def truncate_error(value: str, limit: int = 1200) -> str:
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "...[truncated]"
+
+
+def run_subprocess(
+    cmd: list[str],
+    *,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -42,44 +55,153 @@ def run_subprocess_json(cmd: list[str], *, timeout_seconds: int) -> tuple[int, d
         check=False,
     )
 
-    stdout = completed.stdout.strip()
-    stderr = completed.stderr.strip()
 
-    if not stdout:
-        return completed.returncode, None, stdout, stderr
-
+def parse_result(stdout_text: str) -> dict[str, Any]:
+    stdout_text = stdout_text.strip()
+    if not stdout_text:
+        raise RuntimeError("subprocess produced no stdout")
     try:
-        parsed = json.loads(stdout)
-        return completed.returncode, parsed, stdout, stderr
-    except json.JSONDecodeError:
-        return completed.returncode, None, stdout, stderr
+        return json.loads(stdout_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"subprocess stdout was not valid JSON: {stdout_text}") from exc
+
+
+def final_forced_found_label(result: dict[str, Any]) -> bool:
+    attempts = result.get("verification_attempts") or []
+    if not attempts:
+        return False
+    summary = attempts[-1].get("summary") or {}
+    forced = summary.get("forced_hydration") or {}
+    return forced.get("found_label") is True
+
+
+def final_query_found_label(result: dict[str, Any]) -> bool:
+    attempts = result.get("verification_attempts") or []
+    if not attempts:
+        return False
+    summary = attempts[-1].get("summary") or {}
+    query = summary.get("query_labels") or {}
+    return query.get("found_label") is True
+
+
+def update_label_work_item_success(
+    *,
+    session,
+    job_id: int,
+    result: dict[str, Any],
+) -> None:
+    attempts = result.get("verification_attempts") or []
+    last_summary = attempts[-1].get("summary") if attempts else {}
+
+    ozone_response = result.get("ozone_response") or {}
+    ozone_event_id = ozone_response.get("id")
+    ozone_created_at = ozone_response.get("createdAt")
+
+    query_summary = last_summary.get("query_labels") or {}
+    forced_summary = last_summary.get("forced_hydration") or {}
+
+    session.execute(
+        text(
+            """
+            UPDATE label_work_item
+            SET
+                state = 'published',
+                ozone_event_id = :ozone_event_id,
+                ozone_created_at = :ozone_created_at,
+                final_forced_found_label = :final_forced_found_label,
+                final_query_found_label = :final_query_found_label,
+                manual_success = :manual_success,
+                last_error = NULL,
+                updated_at = NOW()
+            WHERE id = :job_id
+            """
+        ),
+        {
+            "job_id": job_id,
+            "ozone_event_id": ozone_event_id,
+            "ozone_created_at": ozone_created_at,
+            "final_forced_found_label": forced_summary.get("found_label"),
+            "final_query_found_label": query_summary.get("found_label"),
+            "manual_success": result.get("success"),
+        },
+    )
+
+
+def update_label_work_item_retry(
+    *,
+    session,
+    job_id: int,
+    result: dict[str, Any] | None,
+    error_text: str,
+) -> None:
+    ozone_event_id = None
+    ozone_created_at = None
+    final_forced = None
+    final_query = None
+    manual_success = None
+
+    if result is not None:
+        ozone_response = result.get("ozone_response") or {}
+        ozone_event_id = ozone_response.get("id")
+        ozone_created_at = ozone_response.get("createdAt")
+
+        attempts = result.get("verification_attempts") or []
+        if attempts:
+            summary = attempts[-1].get("summary") or {}
+            forced = summary.get("forced_hydration") or {}
+            query = summary.get("query_labels") or {}
+            final_forced = forced.get("found_label")
+            final_query = query.get("found_label")
+
+        manual_success = result.get("success")
+
+    session.execute(
+        text(
+            """
+            UPDATE label_work_item
+            SET
+                ozone_event_id = COALESCE(:ozone_event_id, ozone_event_id),
+                ozone_created_at = COALESCE(:ozone_created_at, ozone_created_at),
+                final_forced_found_label = COALESCE(:final_forced_found_label, final_forced_found_label),
+                final_query_found_label = COALESCE(:final_query_found_label, final_query_found_label),
+                manual_success = COALESCE(:manual_success, manual_success),
+                last_error = :last_error,
+                updated_at = NOW()
+            WHERE id = :job_id
+            """
+        ),
+        {
+            "job_id": job_id,
+            "ozone_event_id": ozone_event_id,
+            "ozone_created_at": ozone_created_at,
+            "final_forced_found_label": final_forced,
+            "final_query_found_label": final_query,
+            "manual_success": manual_success,
+            "last_error": truncate_error(error_text),
+        },
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Lease label_work_item rows and process them through the proven manual publish+verify path."
-    )
-    parser.add_argument("--worker-id", default=None)
-    parser.add_argument("--batch-size", type=int, default=5)
+    parser = argparse.ArgumentParser(description="Lease label work items and publish labels.")
+    parser.add_argument("--worker-id", default=f"apply-{socket.gethostname()}")
+    parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--lease-seconds", type=int, default=180)
-    parser.add_argument("--idle-sleep-seconds", type=float, default=1.0)
     parser.add_argument("--verify-timeout-seconds", type=int, default=10)
     parser.add_argument("--verify-interval-seconds", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--backoff-base-seconds", type=int, default=15)
+    parser.add_argument("--idle-sleep-seconds", type=float, default=1.0)
     args = parser.parse_args()
-
-    init_db()
 
     repo_root = Path(__file__).resolve().parent.parent
     python_bin = sys.executable
-    worker_id = args.worker_id or f"{socket.gethostname()}:{Path(sys.argv[0]).name}:{os_getpid_safe()}"
 
     print_json_line(
         {
             "event": "label_apply_worker_started",
             "checked_at": iso_now(),
-            "worker_id": worker_id,
+            "worker_id": args.worker_id,
             "batch_size": args.batch_size,
             "lease_seconds": args.lease_seconds,
             "verify_timeout_seconds": args.verify_timeout_seconds,
@@ -91,9 +213,9 @@ def main() -> None:
 
     while True:
         with SessionLocal() as session:
-            jobs = lease_label_work_items(
+            jobs = lease_publish_jobs(
                 session,
-                worker_id=worker_id,
+                worker_id=args.worker_id,
                 batch_size=args.batch_size,
                 lease_seconds=args.lease_seconds,
             )
@@ -104,34 +226,22 @@ def main() -> None:
             continue
 
         for job in jobs:
-            post_url = job.get("post_url")
-            label_value = job.get("label_value")
             job_id = job["id"]
-            attempt_count = int(job.get("attempt_count") or 0)
+            post_url = job["post_url"]
+            label_value = job["label_value"]
+            attempt_count = int(job["attempt_count"] or 0)
 
-            if not post_url:
-                with SessionLocal() as session:
-                    mark_label_work_item_dead(
-                        session,
-                        job_id=job_id,
-                        result=None,
-                        error_text="Missing post_url on leased work item",
-                    )
-                    session.commit()
-
-                print_json_line(
-                    {
-                        "event": "label_apply_dead",
-                        "checked_at": iso_now(),
-                        "worker_id": worker_id,
-                        "job_id": job_id,
-                        "post_url": post_url,
-                        "label_value": label_value,
-                        "record_created_at": job.get("record_created_at"),
-                        "error": "Missing post_url on leased work item",
-                    }
-                )
-                continue
+            print_json_line(
+                {
+                    "event": "label_apply_started",
+                    "checked_at": iso_now(),
+                    "worker_id": args.worker_id,
+                    "job_id": job_id,
+                    "post_url": post_url,
+                    "label_value": label_value,
+                    "attempt_count": attempt_count,
+                }
+            )
 
             cmd = [
                 python_bin,
@@ -144,187 +254,137 @@ def main() -> None:
                 str(args.verify_timeout_seconds),
                 "--verify-interval-seconds",
                 str(args.verify_interval_seconds),
+                "--skip-subscriber-check",
                 "--json",
             ]
 
-            rc = -1
-            result = None
-            stdout = ""
-            stderr = ""
+            result: dict[str, Any] | None = None
+            error_text: str | None = None
 
             try:
-                rc, result, stdout, stderr = run_subprocess_json(
+                completed = run_subprocess(
                     cmd,
                     timeout_seconds=max(args.verify_timeout_seconds + 30, 60),
                 )
 
-                if rc == 0 and result is not None and result.get("success") is True:
-                    with SessionLocal() as session:
-                        mark_label_work_item_visible(
-                            session,
-                            job_id=job_id,
-                            result=result,
+                stdout_text = completed.stdout.strip()
+                stderr_text = completed.stderr.strip()
+
+                if completed.returncode not in (0, 2):
+                    error_text = f"subprocess_stderr rc={completed.returncode}: {stderr_text or stdout_text}"
+                else:
+                    result = parse_result(stdout_text)
+
+                    if final_forced_found_label(result):
+                        with SessionLocal() as session:
+                            update_label_work_item_success(
+                                session=session,
+                                job_id=job_id,
+                                result=result,
+                            )
+                            mark_publish_job_published(session=session, job_id=job_id)
+                            session.commit()
+
+                        print_json_line(
+                            {
+                                "event": "label_apply_succeeded",
+                                "checked_at": iso_now(),
+                                "worker_id": args.worker_id,
+                                "job_id": job_id,
+                                "post_url": post_url,
+                                "label_value": label_value,
+                                "ozone_event_id": (result.get("ozone_response") or {}).get("id"),
+                                "ozone_created_at": (result.get("ozone_response") or {}).get("createdAt"),
+                                "final_forced_found_label": True,
+                                "final_query_found_label": final_query_found_label(result),
+                                "manual_success": result.get("success"),
+                            }
                         )
-                        session.commit()
+                        continue
 
-                    attempts = result.get("verification_attempts") or []
-                    final_summary = attempts[-1]["summary"] if attempts else {}
+                    error_text = f"verification_unsuccessful rc={completed.returncode}"
 
-                    print_json_line(
-                        {
-                            "event": "label_apply_visible",
-                            "checked_at": iso_now(),
-                            "worker_id": worker_id,
-                            "job_id": job_id,
-                            "post_url": post_url,
-                            "record_created_at": job.get("record_created_at"),
-                            "label_value": label_value,
-                            "ozone_event_id": (result.get("ozone_response") or {}).get("id"),
-                            "ozone_created_at": (result.get("ozone_response") or {}).get("createdAt"),
-                            "final_forced_found_label": (final_summary.get("forced_hydration") or {}).get("found_label"),
-                            "final_query_found_label": (final_summary.get("query_labels") or {}).get("found_label"),
-                            "final_subscriber_found_label": (final_summary.get("subscriber_hydration") or {}).get("found_label"),
-                            "message": "visible",
-                        }
+            except Exception as exc:
+                error_text = str(exc)
+
+            assert error_text is not None
+
+            next_attempt = attempt_count + 1
+
+            with SessionLocal() as session:
+                update_label_work_item_retry(
+                    session=session,
+                    job_id=job_id,
+                    result=result,
+                    error_text=error_text,
+                )
+
+                if next_attempt >= args.max_attempts:
+                    mark_publish_job_dead(
+                        session=session,
+                        job_id=job_id,
+                        error_text=truncate_error(error_text),
                     )
-                    continue
-
-                error_text = build_error_text(rc=rc, result=result, stdout=stdout, stderr=stderr)
-
-                if attempt_count >= args.max_attempts:
-                    with SessionLocal() as session:
-                        mark_label_work_item_dead(
-                            session,
-                            job_id=job_id,
-                            result=result,
-                            error_text=error_text,
-                        )
-                        session.commit()
+                    session.execute(
+                        text(
+                            """
+                            UPDATE label_work_item
+                            SET state = 'dead', updated_at = NOW()
+                            WHERE id = :job_id
+                            """
+                        ),
+                        {"job_id": job_id},
+                    )
+                    session.commit()
 
                     print_json_line(
                         {
                             "event": "label_apply_dead",
                             "checked_at": iso_now(),
-                            "worker_id": worker_id,
+                            "worker_id": args.worker_id,
                             "job_id": job_id,
                             "post_url": post_url,
-                            "record_created_at": job.get("record_created_at"),
                             "label_value": label_value,
-                            "final_forced_found_label": extract_final_forced(result),
-                            "ozone_created_at": extract_ozone_created_at(result),
-                            "error": error_text,
+                            "attempt_count": next_attempt,
+                            "error": truncate_error(error_text),
                         }
                     )
                 else:
                     delay_seconds = next_backoff_seconds(
-                        attempt_count=attempt_count,
+                        attempt_count_after_failure=next_attempt,
                         base_seconds=args.backoff_base_seconds,
                     )
-                    with SessionLocal() as session:
-                        mark_label_work_item_retry(
-                            session,
-                            job_id=job_id,
-                            result=result,
-                            error_text=error_text,
-                            delay_seconds=delay_seconds,
-                        )
-                        session.commit()
+                    mark_publish_job_retry(
+                        session=session,
+                        job_id=job_id,
+                        error_text=truncate_error(error_text),
+                        delay_seconds=delay_seconds,
+                    )
+                    session.execute(
+                        text(
+                            """
+                            UPDATE label_work_item
+                            SET state = 'queued', updated_at = NOW()
+                            WHERE id = :job_id
+                            """
+                        ),
+                        {"job_id": job_id},
+                    )
+                    session.commit()
 
                     print_json_line(
                         {
-                            "event": "label_apply_retry",
+                            "event": "label_apply_retry_scheduled",
                             "checked_at": iso_now(),
-                            "worker_id": worker_id,
+                            "worker_id": args.worker_id,
                             "job_id": job_id,
                             "post_url": post_url,
-                            "record_created_at": job.get("record_created_at"),
                             "label_value": label_value,
-                            "final_forced_found_label": extract_final_forced(result),
-                            "ozone_created_at": extract_ozone_created_at(result),
+                            "attempt_count": next_attempt,
                             "delay_seconds": delay_seconds,
-                            "error": error_text,
+                            "error": truncate_error(error_text),
                         }
                     )
-
-            except Exception as exc:
-                error_text = f"{type(exc).__name__}: {exc}"
-
-                if attempt_count >= args.max_attempts:
-                    with SessionLocal() as session:
-                        mark_label_work_item_dead(
-                            session,
-                            job_id=job_id,
-                            result=result,
-                            error_text=error_text,
-                        )
-                        session.commit()
-                else:
-                    delay_seconds = next_backoff_seconds(
-                        attempt_count=attempt_count,
-                        base_seconds=args.backoff_base_seconds,
-                    )
-                    with SessionLocal() as session:
-                        mark_label_work_item_retry(
-                            session,
-                            job_id=job_id,
-                            result=result,
-                            error_text=error_text,
-                            delay_seconds=delay_seconds,
-                        )
-                        session.commit()
-
-                print_json_line(
-                    {
-                        "event": "label_apply_exception",
-                        "checked_at": iso_now(),
-                        "worker_id": worker_id,
-                        "job_id": job_id,
-                        "post_url": post_url,
-                        "record_created_at": job.get("record_created_at"),
-                        "label_value": label_value,
-                        "error": error_text,
-                    }
-                )
-
-
-def os_getpid_safe() -> int:
-    try:
-        import os
-        return os.getpid()
-    except Exception:
-        return 0
-
-
-def extract_ozone_created_at(result: dict[str, Any] | None) -> str | None:
-    if not result:
-        return None
-    return (result.get("ozone_response") or {}).get("createdAt")
-
-
-def extract_final_forced(result: dict[str, Any] | None) -> bool | None:
-    if not result:
-        return None
-    attempts = result.get("verification_attempts") or []
-    if not attempts:
-        return None
-    final_summary = (attempts[-1] or {}).get("summary") or {}
-    return (final_summary.get("forced_hydration") or {}).get("found_label")
-
-
-def build_error_text(
-    *,
-    rc: int,
-    result: dict[str, Any] | None,
-    stdout: str,
-    stderr: str,
-) -> str:
-    if result is not None and result.get("success") is False:
-        return f"verification_unsuccessful rc={rc}"
-    if stdout and not result:
-        return f"non_json_stdout rc={rc}: {stdout[:500]}"
-    if stderr:
-        return f"subprocess_stderr rc={rc}: {stderr[:500]}"
-    return f"subprocess_failed rc={rc}"
 
 
 if __name__ == "__main__":
