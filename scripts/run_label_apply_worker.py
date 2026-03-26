@@ -23,7 +23,6 @@ from scripts.manual_publish_and_verify import (
     ScriptSettings,
     publish_label_via_ozone,
     resolve_post,
-    resolve_post_from_known_values,
     summarize_snapshot,
     verify_once,
 )
@@ -369,27 +368,26 @@ def main() -> None:
 
             try:
                 if post_uri and post_cid:
-                    resolved = resolve_post_from_known_values(
-                        post_url=post_url,
-                        at_uri=post_uri,
-                        cid=post_cid,
-                    )
+                    at_uri = post_uri
+                    cid = post_cid
                 else:
                     resolved = resolve_post(
                         post_url=post_url,
                         timeout=args.request_timeout_seconds,
                     )
+                    at_uri = resolved.at_uri
+                    cid = resolved.cid
 
                 ozone_response = publish_label_via_ozone(
-                    at_uri=resolved.at_uri,
-                    cid=resolved.cid,
+                    at_uri=at_uri,
+                    cid=cid,
                     label_value=label_value,
                 )
 
                 deadline = time.monotonic() + args.verify_timeout_seconds
                 while True:
                     snapshot = verify_once(
-                        at_uri=resolved.at_uri,
+                        at_uri=at_uri,
                         label_value=label_value,
                         labeler_did=labeler_did,
                         timeout=args.request_timeout_seconds,

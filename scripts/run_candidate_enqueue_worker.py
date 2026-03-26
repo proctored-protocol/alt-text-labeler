@@ -144,6 +144,8 @@ def main() -> None:
             }
         )
 
+        time.sleep(args.poll_seconds)
+
 
 if __name__ == "__main__":
     main()
