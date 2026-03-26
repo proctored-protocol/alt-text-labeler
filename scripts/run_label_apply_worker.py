@@ -10,7 +10,6 @@ from typing import Any
 from sqlalchemy import text
 
 from app.db import SessionLocal
-from app.integrations.ozone.auth import OzoneAuthError
 from app.services.publish_queue import (
     lease_publish_jobs,
     mark_publish_job_dead,
@@ -22,7 +21,6 @@ from scripts.manual_publish_and_verify import (
     HTTPJSONError,
     ScriptSettings,
     publish_label_via_ozone,
-    resolve_post,
     summarize_snapshot,
     verify_once,
 )
@@ -55,8 +53,6 @@ def is_not_found_error(exc: Exception) -> bool:
 def is_rate_limit_error(exc: Exception) -> bool:
     if isinstance(exc, HTTPJSONError) and exc.code == 429:
         return True
-    if isinstance(exc, OzoneAuthError) and exc.status_code == 429:
-        return True
 
     msg = str(exc)
     return "HTTP Error 429" in msg or "HTTP 429" in msg or "Too Many Requests" in msg
@@ -76,18 +72,28 @@ def fetch_label_work_item(
                 id,
                 uri,
                 cid,
-                post_url,
-                post_uri,
-                post_cid,
-                record_created_at,
                 label_value,
+                post_url,
+                record_created_at,
+                evaluated_at,
                 state,
+                attempt_count,
+                next_attempt_at,
+                leased_until,
+                leased_by,
                 ozone_event_id,
                 ozone_created_at,
+                final_forced_status_code,
+                final_query_status_code,
+                final_subscriber_status_code,
                 final_forced_found_label,
                 final_query_found_label,
+                final_subscriber_found_label,
                 manual_success,
+                label_visible_at,
                 last_error,
+                raw_result_json,
+                created_at,
                 updated_at
             FROM label_work_item
             WHERE uri = :uri
@@ -107,19 +113,47 @@ def fetch_label_work_item(
     return dict(row) if row is not None else None
 
 
-def mark_label_work_item_leased(*, session, work_item_id: int) -> None:
+def mark_label_work_item_leased(
+    *,
+    session,
+    work_item_id: int,
+    worker_id: str,
+    lease_seconds: int,
+) -> None:
     session.execute(
         text(
             """
             UPDATE label_work_item
             SET
                 state = 'leased',
+                leased_until = NOW() + (:lease_seconds * INTERVAL '1 second'),
+                leased_by = :worker_id,
                 updated_at = NOW()
             WHERE id = :work_item_id
             """
         ),
-        {"work_item_id": work_item_id},
+        {
+            "work_item_id": work_item_id,
+            "worker_id": worker_id,
+            "lease_seconds": lease_seconds,
+        },
     )
+
+
+def extract_final_fields(final_summary: dict[str, Any] | None) -> dict[str, Any]:
+    summary = final_summary or {}
+    query_labels = summary.get("query_labels") or {}
+    forced_hydration = summary.get("forced_hydration") or {}
+    subscriber_hydration = summary.get("subscriber_hydration") or {}
+
+    return {
+        "final_forced_status_code": forced_hydration.get("status_code"),
+        "final_query_status_code": query_labels.get("status_code"),
+        "final_subscriber_status_code": subscriber_hydration.get("status_code"),
+        "final_forced_found_label": forced_hydration.get("found_label"),
+        "final_query_found_label": query_labels.get("found_label"),
+        "final_subscriber_found_label": subscriber_hydration.get("found_label"),
+    }
 
 
 def update_label_work_item_success(
@@ -129,8 +163,13 @@ def update_label_work_item_success(
     ozone_response: dict[str, Any],
     final_summary: dict[str, Any],
 ) -> None:
-    forced_summary = final_summary.get("forced_hydration") or {}
-    query_summary = final_summary.get("query_labels") or {}
+    fields = extract_final_fields(final_summary)
+
+    raw_result = {
+        "ozone_response": ozone_response,
+        "final_summary": final_summary,
+        "success": True,
+    }
 
     session.execute(
         text(
@@ -138,12 +177,20 @@ def update_label_work_item_success(
             UPDATE label_work_item
             SET
                 state = 'published',
+                leased_until = NULL,
+                leased_by = NULL,
                 ozone_event_id = :ozone_event_id,
                 ozone_created_at = :ozone_created_at,
+                final_forced_status_code = :final_forced_status_code,
+                final_query_status_code = :final_query_status_code,
+                final_subscriber_status_code = :final_subscriber_status_code,
                 final_forced_found_label = :final_forced_found_label,
                 final_query_found_label = :final_query_found_label,
+                final_subscriber_found_label = :final_subscriber_found_label,
                 manual_success = TRUE,
+                label_visible_at = NOW(),
                 last_error = NULL,
+                raw_result_json = :raw_result_json,
                 updated_at = NOW()
             WHERE id = :work_item_id
             """
@@ -152,8 +199,13 @@ def update_label_work_item_success(
             "work_item_id": work_item_id,
             "ozone_event_id": ozone_response.get("id"),
             "ozone_created_at": ozone_response.get("createdAt"),
-            "final_forced_found_label": forced_summary.get("found_label"),
-            "final_query_found_label": query_summary.get("found_label"),
+            "final_forced_status_code": fields["final_forced_status_code"],
+            "final_query_status_code": fields["final_query_status_code"],
+            "final_subscriber_status_code": fields["final_subscriber_status_code"],
+            "final_forced_found_label": fields["final_forced_found_label"],
+            "final_query_found_label": fields["final_query_found_label"],
+            "final_subscriber_found_label": fields["final_subscriber_found_label"],
+            "raw_result_json": json.dumps(raw_result, ensure_ascii=False, default=str),
         },
     )
 
@@ -166,8 +218,14 @@ def update_label_work_item_retry(
     ozone_response: dict[str, Any] | None = None,
     final_summary: dict[str, Any] | None = None,
 ) -> None:
-    forced_summary = (final_summary or {}).get("forced_hydration") or {}
-    query_summary = (final_summary or {}).get("query_labels") or {}
+    fields = extract_final_fields(final_summary)
+
+    raw_result = {
+        "ozone_response": ozone_response,
+        "final_summary": final_summary,
+        "success": False,
+        "error": error_text,
+    }
 
     session.execute(
         text(
@@ -175,12 +233,19 @@ def update_label_work_item_retry(
             UPDATE label_work_item
             SET
                 state = 'queued',
+                leased_until = NULL,
+                leased_by = NULL,
                 ozone_event_id = COALESCE(:ozone_event_id, ozone_event_id),
                 ozone_created_at = COALESCE(:ozone_created_at, ozone_created_at),
+                final_forced_status_code = COALESCE(:final_forced_status_code, final_forced_status_code),
+                final_query_status_code = COALESCE(:final_query_status_code, final_query_status_code),
+                final_subscriber_status_code = COALESCE(:final_subscriber_status_code, final_subscriber_status_code),
                 final_forced_found_label = COALESCE(:final_forced_found_label, final_forced_found_label),
                 final_query_found_label = COALESCE(:final_query_found_label, final_query_found_label),
+                final_subscriber_found_label = COALESCE(:final_subscriber_found_label, final_subscriber_found_label),
                 manual_success = FALSE,
                 last_error = :last_error,
+                raw_result_json = :raw_result_json,
                 updated_at = NOW()
             WHERE id = :work_item_id
             """
@@ -189,9 +254,14 @@ def update_label_work_item_retry(
             "work_item_id": work_item_id,
             "ozone_event_id": (ozone_response or {}).get("id"),
             "ozone_created_at": (ozone_response or {}).get("createdAt"),
-            "final_forced_found_label": forced_summary.get("found_label"),
-            "final_query_found_label": query_summary.get("found_label"),
+            "final_forced_status_code": fields["final_forced_status_code"],
+            "final_query_status_code": fields["final_query_status_code"],
+            "final_subscriber_status_code": fields["final_subscriber_status_code"],
+            "final_forced_found_label": fields["final_forced_found_label"],
+            "final_query_found_label": fields["final_query_found_label"],
+            "final_subscriber_found_label": fields["final_subscriber_found_label"],
             "last_error": truncate_error(error_text),
+            "raw_result_json": json.dumps(raw_result, ensure_ascii=False, default=str),
         },
     )
 
@@ -208,6 +278,8 @@ def update_label_work_item_dead(
             UPDATE label_work_item
             SET
                 state = 'dead',
+                leased_until = NULL,
+                leased_by = NULL,
                 manual_success = FALSE,
                 last_error = :last_error,
                 updated_at = NOW()
@@ -328,7 +400,12 @@ def main() -> None:
                     )
                     continue
 
-                mark_label_work_item_leased(session=session, work_item_id=work_item_id)
+                mark_label_work_item_leased(
+                    session=session,
+                    work_item_id=work_item_id,
+                    worker_id=args.worker_id,
+                    lease_seconds=args.lease_seconds,
+                )
                 hydrated_jobs.append((publish_job, work_item))
 
             session.commit()
@@ -345,8 +422,8 @@ def main() -> None:
 
             work_item_id = int(work_item["id"])
             post_url = work_item["post_url"]
-            post_uri = work_item.get("post_uri")
-            post_cid = work_item.get("post_cid")
+            at_uri = work_item["uri"]
+            cid = work_item["cid"]
             label_value = work_item["label_value"]
 
             print_json_line(
@@ -357,7 +434,7 @@ def main() -> None:
                     "publish_job_id": publish_job_id,
                     "work_item_id": work_item_id,
                     "post_url": post_url,
-                    "post_uri": post_uri,
+                    "post_uri": at_uri,
                     "label_value": label_value,
                     "attempt_count": publish_attempt_count,
                 }
@@ -367,17 +444,6 @@ def main() -> None:
             final_summary: dict[str, Any] | None = None
 
             try:
-                if post_uri and post_cid:
-                    at_uri = post_uri
-                    cid = post_cid
-                else:
-                    resolved = resolve_post(
-                        post_url=post_url,
-                        timeout=args.request_timeout_seconds,
-                    )
-                    at_uri = resolved.at_uri
-                    cid = resolved.cid
-
                 ozone_response = publish_label_via_ozone(
                     at_uri=at_uri,
                     cid=cid,
@@ -486,7 +552,7 @@ def main() -> None:
                         "publish_job_id": publish_job_id,
                         "work_item_id": work_item_id,
                         "post_url": post_url,
-                        "post_uri": post_uri,
+                        "post_uri": at_uri,
                         "label_value": label_value,
                         "error": truncate_error(error_text),
                     }
@@ -519,7 +585,7 @@ def main() -> None:
                         "publish_job_id": publish_job_id,
                         "work_item_id": work_item_id,
                         "post_url": post_url,
-                        "post_uri": post_uri,
+                        "post_uri": at_uri,
                         "label_value": label_value,
                         "ozone_event_id": (ozone_response or {}).get("id"),
                         "ozone_created_at": (ozone_response or {}).get("createdAt"),
@@ -570,7 +636,7 @@ def main() -> None:
                         "publish_job_id": publish_job_id,
                         "work_item_id": work_item_id,
                         "post_url": post_url,
-                        "post_uri": post_uri,
+                        "post_uri": at_uri,
                         "label_value": label_value,
                         "ozone_event_id": (ozone_response or {}).get("id"),
                         "ozone_created_at": (ozone_response or {}).get("createdAt"),
