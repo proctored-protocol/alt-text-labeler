@@ -30,22 +30,14 @@ def main() -> None:
             )
         ).mappings().all()
 
-        publish_counts = conn.execute(
-            text(
-                """
-                SELECT state, COUNT(*) AS n
-                FROM publish_job
-                GROUP BY state
-                ORDER BY state
-                """
-            )
-        ).mappings().all()
-
         throughput_10m = conn.execute(
             text(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '10 minutes') AS queued_last_10m,
+                    COUNT(*) FILTER (
+                        WHERE state = 'queued'
+                          AND updated_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS queued_last_10m,
                     COUNT(*) FILTER (
                         WHERE state = 'published'
                           AND updated_at >= NOW() - INTERVAL '10 minutes'
@@ -76,6 +68,22 @@ def main() -> None:
             )
         ).mappings().one()
 
+        worker_leases = conn.execute(
+            text(
+                """
+                SELECT
+                    leased_by,
+                    COUNT(*) AS n,
+                    MIN(lease_expires_at) AS earliest_lease_expiry,
+                    MAX(updated_at) AS latest_update
+                FROM label_work_item
+                WHERE state = 'leased'
+                GROUP BY leased_by
+                ORDER BY leased_by
+                """
+            )
+        ).mappings().all()
+
         recent_items = conn.execute(
             text(
                 """
@@ -90,6 +98,8 @@ def main() -> None:
                     final_query_found_label,
                     manual_success,
                     last_error,
+                    leased_by,
+                    lease_expires_at,
                     updated_at
                 FROM label_work_item
                 ORDER BY updated_at DESC
@@ -98,30 +108,10 @@ def main() -> None:
             )
         ).mappings().all()
 
-        worker_leases = conn.execute(
-            text(
-                """
-                SELECT
-                    leased_by,
-                    COUNT(*) AS n,
-                    MIN(leased_until) AS earliest_lease_expiry,
-                    MAX(updated_at) AS latest_update
-                FROM publish_job
-                WHERE state = 'leased'
-                GROUP BY leased_by
-                ORDER BY leased_by
-                """
-            )
-        ).mappings().all()
-
     print(f"generated_at_utc: {utc_now().isoformat()}")
 
     print_section("label_work_item counts")
     for row in queue_counts:
-        print(dict(row))
-
-    print_section("publish_job counts")
-    for row in publish_counts:
         print(dict(row))
 
     print_section("10-minute throughput")

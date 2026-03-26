@@ -13,13 +13,6 @@ from typing import Any
 from sqlalchemy import text
 
 from app.db import SessionLocal
-from app.services.publish_queue import (
-    lease_publish_jobs,
-    mark_publish_job_dead,
-    mark_publish_job_published,
-    mark_publish_job_retry,
-    next_backoff_seconds,
-)
 
 
 def utc_now() -> datetime:
@@ -84,9 +77,82 @@ def final_query_found_label(result: dict[str, Any]) -> bool:
     return query.get("found_label") is True
 
 
-def update_label_work_item_success(
+def verification_visible_enough(result: dict[str, Any]) -> bool:
+    return final_forced_found_label(result) and final_query_found_label(result)
+
+
+def lease_label_work_items(
     *,
-    session,
+    worker_id: str,
+    batch_size: int,
+    lease_seconds: int,
+) -> list[dict[str, Any]]:
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                WITH candidates AS (
+                    SELECT id
+                    FROM label_work_item
+                    WHERE
+                        (
+                            state = 'queued'
+                            AND (
+                                lease_expires_at IS NULL
+                                OR lease_expires_at < NOW()
+                            )
+                        )
+                        OR (
+                            state = 'leased'
+                            AND lease_expires_at IS NOT NULL
+                            AND lease_expires_at < NOW()
+                        )
+                    ORDER BY updated_at ASC, id ASC
+                    LIMIT :batch_size
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE label_work_item AS lwi
+                SET
+                    state = 'leased',
+                    leased_by = :worker_id,
+                    lease_expires_at = NOW() + (:lease_seconds * INTERVAL '1 second'),
+                    updated_at = NOW()
+                FROM candidates
+                WHERE lwi.id = candidates.id
+                RETURNING
+                    lwi.id,
+                    lwi.post_url,
+                    lwi.record_created_at,
+                    lwi.label_value,
+                    lwi.state,
+                    lwi.ozone_event_id,
+                    lwi.ozone_created_at,
+                    lwi.final_forced_found_label,
+                    lwi.final_query_found_label,
+                    lwi.manual_success,
+                    lwi.last_error,
+                    lwi.attempt_count,
+                    lwi.leased_by,
+                    lwi.lease_expires_at,
+                    lwi.updated_at
+                """
+            ),
+            {
+                "worker_id": worker_id,
+                "batch_size": batch_size,
+                "lease_seconds": lease_seconds,
+            },
+        ).mappings().all()
+        session.commit()
+        return [dict(row) for row in rows]
+
+
+def next_backoff_seconds(*, attempt_count_after_failure: int, base_seconds: int) -> int:
+    return min(base_seconds * (2 ** max(0, attempt_count_after_failure - 1)), 1800)
+
+
+def mark_label_work_item_published(
+    *,
     job_id: int,
     result: dict[str, Any],
 ) -> None:
@@ -100,40 +166,45 @@ def update_label_work_item_success(
     query_summary = last_summary.get("query_labels") or {}
     forced_summary = last_summary.get("forced_hydration") or {}
 
-    session.execute(
-        text(
-            """
-            UPDATE label_work_item
-            SET
-                state = 'published',
-                ozone_event_id = :ozone_event_id,
-                ozone_created_at = :ozone_created_at,
-                final_forced_found_label = :final_forced_found_label,
-                final_query_found_label = :final_query_found_label,
-                manual_success = :manual_success,
-                last_error = NULL,
-                updated_at = NOW()
-            WHERE id = :job_id
-            """
-        ),
-        {
-            "job_id": job_id,
-            "ozone_event_id": ozone_event_id,
-            "ozone_created_at": ozone_created_at,
-            "final_forced_found_label": forced_summary.get("found_label"),
-            "final_query_found_label": query_summary.get("found_label"),
-            "manual_success": result.get("success"),
-        },
-    )
+    with SessionLocal() as session:
+        session.execute(
+            text(
+                """
+                UPDATE label_work_item
+                SET
+                    state = 'published',
+                    ozone_event_id = :ozone_event_id,
+                    ozone_created_at = :ozone_created_at,
+                    final_forced_found_label = :final_forced_found_label,
+                    final_query_found_label = :final_query_found_label,
+                    manual_success = :manual_success,
+                    last_error = NULL,
+                    leased_by = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE id = :job_id
+                """
+            ),
+            {
+                "job_id": job_id,
+                "ozone_event_id": ozone_event_id,
+                "ozone_created_at": ozone_created_at,
+                "final_forced_found_label": forced_summary.get("found_label"),
+                "final_query_found_label": query_summary.get("found_label"),
+                "manual_success": True,
+            },
+        )
+        session.commit()
 
 
-def update_label_work_item_retry(
+def mark_label_work_item_retry(
     *,
-    session,
     job_id: int,
     result: dict[str, Any] | None,
     error_text: str,
-) -> None:
+    max_attempts: int,
+    backoff_base_seconds: int,
+) -> tuple[str, int]:
     ozone_event_id = None
     ozone_created_at = None
     final_forced = None
@@ -155,31 +226,66 @@ def update_label_work_item_retry(
 
         manual_success = result.get("success")
 
-    session.execute(
-        text(
-            """
-            UPDATE label_work_item
-            SET
-                ozone_event_id = COALESCE(:ozone_event_id, ozone_event_id),
-                ozone_created_at = COALESCE(:ozone_created_at, ozone_created_at),
-                final_forced_found_label = COALESCE(:final_forced_found_label, final_forced_found_label),
-                final_query_found_label = COALESCE(:final_query_found_label, final_query_found_label),
-                manual_success = COALESCE(:manual_success, manual_success),
-                last_error = :last_error,
-                updated_at = NOW()
-            WHERE id = :job_id
-            """
-        ),
-        {
-            "job_id": job_id,
-            "ozone_event_id": ozone_event_id,
-            "ozone_created_at": ozone_created_at,
-            "final_forced_found_label": final_forced,
-            "final_query_found_label": final_query,
-            "manual_success": manual_success,
-            "last_error": truncate_error(error_text),
-        },
-    )
+    with SessionLocal() as session:
+        current = session.execute(
+            text(
+                """
+                SELECT attempt_count
+                FROM label_work_item
+                WHERE id = :job_id
+                """
+            ),
+            {"job_id": job_id},
+        ).mappings().one()
+
+        attempt_count_after_failure = int(current["attempt_count"] or 0) + 1
+
+        if attempt_count_after_failure >= max_attempts:
+            new_state = "dead"
+            delay_seconds = 0
+            lease_sql = "NULL"
+        else:
+            new_state = "queued"
+            delay_seconds = next_backoff_seconds(
+                attempt_count_after_failure=attempt_count_after_failure,
+                base_seconds=backoff_base_seconds,
+            )
+            lease_sql = "NOW() + (:delay_seconds * INTERVAL '1 second')"
+
+        session.execute(
+            text(
+                f"""
+                UPDATE label_work_item
+                SET
+                    state = :new_state,
+                    attempt_count = attempt_count + 1,
+                    ozone_event_id = COALESCE(:ozone_event_id, ozone_event_id),
+                    ozone_created_at = COALESCE(:ozone_created_at, ozone_created_at),
+                    final_forced_found_label = COALESCE(:final_forced_found_label, final_forced_found_label),
+                    final_query_found_label = COALESCE(:final_query_found_label, final_query_found_label),
+                    manual_success = COALESCE(:manual_success, manual_success),
+                    last_error = :last_error,
+                    leased_by = NULL,
+                    lease_expires_at = {lease_sql},
+                    updated_at = NOW()
+                WHERE id = :job_id
+                """
+            ),
+            {
+                "job_id": job_id,
+                "new_state": new_state,
+                "ozone_event_id": ozone_event_id,
+                "ozone_created_at": ozone_created_at,
+                "final_forced_found_label": final_forced,
+                "final_query_found_label": final_query,
+                "manual_success": manual_success,
+                "last_error": truncate_error(error_text),
+                "delay_seconds": delay_seconds,
+            },
+        )
+        session.commit()
+
+    return new_state, attempt_count_after_failure
 
 
 def main() -> None:
@@ -212,14 +318,11 @@ def main() -> None:
     )
 
     while True:
-        with SessionLocal() as session:
-            jobs = lease_publish_jobs(
-                session,
-                worker_id=args.worker_id,
-                batch_size=args.batch_size,
-                lease_seconds=args.lease_seconds,
-            )
-            session.commit()
+        jobs = lease_label_work_items(
+            worker_id=args.worker_id,
+            batch_size=args.batch_size,
+            lease_seconds=args.lease_seconds,
+        )
 
         if not jobs:
             time.sleep(args.idle_sleep_seconds)
@@ -275,15 +378,11 @@ def main() -> None:
                 else:
                     result = parse_result(stdout_text)
 
-                    if final_forced_found_label(result):
-                        with SessionLocal() as session:
-                            update_label_work_item_success(
-                                session=session,
-                                job_id=job_id,
-                                result=result,
-                            )
-                            mark_publish_job_published(session=session, job_id=job_id)
-                            session.commit()
+                    if verification_visible_enough(result):
+                        mark_label_work_item_published(
+                            job_id=job_id,
+                            result=result,
+                        )
 
                         print_json_line(
                             {
@@ -295,7 +394,7 @@ def main() -> None:
                                 "label_value": label_value,
                                 "ozone_event_id": (result.get("ozone_response") or {}).get("id"),
                                 "ozone_created_at": (result.get("ozone_response") or {}).get("createdAt"),
-                                "final_forced_found_label": True,
+                                "final_forced_found_label": final_forced_found_label(result),
                                 "final_query_found_label": final_query_found_label(result),
                                 "manual_success": result.get("success"),
                             }
@@ -309,82 +408,29 @@ def main() -> None:
 
             assert error_text is not None
 
-            next_attempt = attempt_count + 1
+            new_state, next_attempt = mark_label_work_item_retry(
+                job_id=job_id,
+                result=result,
+                error_text=error_text,
+                max_attempts=args.max_attempts,
+                backoff_base_seconds=args.backoff_base_seconds,
+            )
 
-            with SessionLocal() as session:
-                update_label_work_item_retry(
-                    session=session,
-                    job_id=job_id,
-                    result=result,
-                    error_text=error_text,
-                )
-
-                if next_attempt >= args.max_attempts:
-                    mark_publish_job_dead(
-                        session=session,
-                        job_id=job_id,
-                        error_text=truncate_error(error_text),
-                    )
-                    session.execute(
-                        text(
-                            """
-                            UPDATE label_work_item
-                            SET state = 'dead', updated_at = NOW()
-                            WHERE id = :job_id
-                            """
-                        ),
-                        {"job_id": job_id},
-                    )
-                    session.commit()
-
-                    print_json_line(
-                        {
-                            "event": "label_apply_dead",
-                            "checked_at": iso_now(),
-                            "worker_id": args.worker_id,
-                            "job_id": job_id,
-                            "post_url": post_url,
-                            "label_value": label_value,
-                            "attempt_count": next_attempt,
-                            "error": truncate_error(error_text),
-                        }
-                    )
-                else:
-                    delay_seconds = next_backoff_seconds(
-                        attempt_count_after_failure=next_attempt,
-                        base_seconds=args.backoff_base_seconds,
-                    )
-                    mark_publish_job_retry(
-                        session=session,
-                        job_id=job_id,
-                        error_text=truncate_error(error_text),
-                        delay_seconds=delay_seconds,
-                    )
-                    session.execute(
-                        text(
-                            """
-                            UPDATE label_work_item
-                            SET state = 'queued', updated_at = NOW()
-                            WHERE id = :job_id
-                            """
-                        ),
-                        {"job_id": job_id},
-                    )
-                    session.commit()
-
-                    print_json_line(
-                        {
-                            "event": "label_apply_retry_scheduled",
-                            "checked_at": iso_now(),
-                            "worker_id": args.worker_id,
-                            "job_id": job_id,
-                            "post_url": post_url,
-                            "label_value": label_value,
-                            "attempt_count": next_attempt,
-                            "delay_seconds": delay_seconds,
-                            "error": truncate_error(error_text),
-                        }
-                    )
+            print_json_line(
+                {
+                    "event": "label_apply_failed",
+                    "checked_at": iso_now(),
+                    "worker_id": args.worker_id,
+                    "job_id": job_id,
+                    "post_url": post_url,
+                    "label_value": label_value,
+                    "attempt_count_after_failure": next_attempt,
+                    "new_state": new_state,
+                    "error": truncate_error(error_text, 400),
+                    "final_forced_found_label": final_forced_found_label(result) if result else None,
+                    "final_query_found_label": final_query_found_label(result) if result else None,
+                }
+            )
 
 
 if __name__ == "__main__":

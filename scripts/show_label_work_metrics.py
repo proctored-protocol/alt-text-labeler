@@ -12,7 +12,7 @@ def main() -> None:
         by_state = conn.execute(
             text(
                 """
-                SELECT state, count(*) AS n
+                SELECT state, COUNT(*) AS n
                 FROM label_work_item
                 GROUP BY state
                 ORDER BY state
@@ -31,7 +31,10 @@ def main() -> None:
                     state,
                     ozone_created_at,
                     final_forced_found_label,
+                    final_query_found_label,
                     manual_success,
+                    leased_by,
+                    lease_expires_at,
                     last_error,
                     updated_at
                 FROM label_work_item
