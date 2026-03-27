@@ -53,6 +53,62 @@ def fetch_error_buckets(conn, window_minutes: int) -> list[dict[str, Any]]:
     return [{k: normalize(v) for k, v in dict(row).items()} for row in rows]
 
 
+def fetch_window_metrics(conn, window_minutes: int) -> dict[str, Any]:
+    row = conn.execute(
+        text(
+            f"""
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM post_evaluation pe
+                    WHERE pe.evaluated_at >= NOW() - INTERVAL '{window_minutes} minutes'
+                ) AS post_evaluation_rows,
+
+                (
+                    SELECT COUNT(*)
+                    FROM post_evaluation pe
+                    WHERE pe.evaluated_at >= NOW() - INTERVAL '{window_minutes} minutes'
+                      AND pe.derived_label IN ('missing-alt-text', 'partial-alt-text')
+                ) AS labeled_rows,
+
+                (
+                    SELECT COUNT(*)
+                    FROM label_work_item lwi
+                    WHERE lwi.created_at >= NOW() - INTERVAL '{window_minutes} minutes'
+                ) AS queued_rows,
+
+                (
+                    SELECT COUNT(*)
+                    FROM label_work_item lwi
+                    WHERE lwi.ozone_created_at >= NOW() - INTERVAL '{window_minutes} minutes'
+                ) AS emitted_rows,
+
+                (
+                    SELECT COUNT(*)
+                    FROM label_work_item lwi
+                    WHERE lwi.label_visible_at >= NOW() - INTERVAL '{window_minutes} minutes'
+                ) AS verified_rows,
+
+                (
+                    SELECT COUNT(*)
+                    FROM label_work_item lwi
+                    WHERE lwi.state = 'verification_failed'
+                      AND lwi.updated_at >= NOW() - INTERVAL '{window_minutes} minutes'
+                ) AS verification_failed_rows,
+
+                (
+                    SELECT COUNT(*)
+                    FROM label_work_item lwi
+                    WHERE lwi.state = 'dead'
+                      AND lwi.updated_at >= NOW() - INTERVAL '{window_minutes} minutes'
+                ) AS dead_rows
+            """
+        )
+    ).mappings().one()
+
+    return {k: normalize(v) for k, v in dict(row).items()}
+
+
 def main() -> None:
     with engine.connect() as conn:
         current_counts = conn.execute(
@@ -71,100 +127,21 @@ def main() -> None:
             )
         ).mappings().one()
 
-        window_10m = conn.execute(
-            text(
-                """
-                SELECT
-                    COUNT(*) FILTER (
-                        WHERE evaluated_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS post_evaluation_rows_10m,
-
-                    COUNT(*) FILTER (
-                        WHERE evaluated_at >= NOW() - INTERVAL '10 minutes'
-                          AND derived_label IN ('missing-alt-text', 'partial-alt-text')
-                    ) AS labeled_rows_10m,
-
-                    COUNT(*) FILTER (
-                        WHERE created_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS queued_last_10m,
-
-                    COUNT(*) FILTER (
-                        WHERE ozone_created_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS emitted_last_10m,
-
-                    COUNT(*) FILTER (
-                        WHERE label_visible_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS verified_last_10m,
-
-                    COUNT(*) FILTER (
-                        WHERE state = 'verification_failed'
-                          AND updated_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS verification_failed_last_10m,
-
-                    COUNT(*) FILTER (
-                        WHERE state = 'dead'
-                          AND updated_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS dead_last_10m
-                FROM label_work_item lwi
-                CROSS JOIN post_evaluation pe
-                """
-            )
-        ).mappings().one()
-
-        window_60m = conn.execute(
-            text(
-                """
-                SELECT
-                    COUNT(*) FILTER (
-                        WHERE evaluated_at >= NOW() - INTERVAL '60 minutes'
-                    ) AS post_evaluation_rows_60m,
-
-                    COUNT(*) FILTER (
-                        WHERE evaluated_at >= NOW() - INTERVAL '60 minutes'
-                          AND derived_label IN ('missing-alt-text', 'partial-alt-text')
-                    ) AS labeled_rows_60m,
-
-                    COUNT(*) FILTER (
-                        WHERE created_at >= NOW() - INTERVAL '60 minutes'
-                    ) AS queued_last_60m,
-
-                    COUNT(*) FILTER (
-                        WHERE ozone_created_at >= NOW() - INTERVAL '60 minutes'
-                    ) AS emitted_last_60m,
-
-                    COUNT(*) FILTER (
-                        WHERE label_visible_at >= NOW() - INTERVAL '60 minutes'
-                    ) AS verified_last_60m,
-
-                    COUNT(*) FILTER (
-                        WHERE state = 'verification_failed'
-                          AND updated_at >= NOW() - INTERVAL '60 minutes'
-                    ) AS verification_failed_last_60m,
-
-                    COUNT(*) FILTER (
-                        WHERE state = 'dead'
-                          AND updated_at >= NOW() - INTERVAL '60 minutes'
-                    ) AS dead_last_60m
-                FROM label_work_item lwi
-                CROSS JOIN post_evaluation pe
-                """
-            )
-        ).mappings().one()
+        window_10m = fetch_window_metrics(conn, 10)
+        window_60m = fetch_window_metrics(conn, 60)
 
         error_buckets_10m = fetch_error_buckets(conn, 10)
         error_buckets_60m = fetch_error_buckets(conn, 60)
 
     current_counts_out = {k: normalize(v) for k, v in dict(current_counts).items()}
-    window_10m_out = {k: normalize(v) for k, v in dict(window_10m).items()}
-    window_60m_out = {k: normalize(v) for k, v in dict(window_60m).items()}
 
     print(
         json.dumps(
             {
                 "generated_at_utc": utc_now_iso(),
                 "current_counts": current_counts_out,
-                "window_10m": window_10m_out,
-                "window_60m": window_60m_out,
+                "window_10m": window_10m,
+                "window_60m": window_60m,
                 "error_buckets_10m": error_buckets_10m,
                 "error_buckets_60m": error_buckets_60m,
             },
