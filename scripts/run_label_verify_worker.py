@@ -217,10 +217,7 @@ def mark_label_work_item_verification_pending(
                 final_forced_found_label = :final_forced_found_label,
                 final_query_found_label = :final_query_found_label,
                 final_subscriber_found_label = :final_subscriber_found_label,
-                last_error = CASE
-                    WHEN :last_error IS NULL THEN NULL
-                    ELSE :last_error
-                END,
+                last_error = :last_error,
                 raw_result_json = :raw_result_json,
                 updated_at = NOW()
             WHERE id = :work_item_id
