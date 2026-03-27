@@ -19,4 +19,5 @@ def save_cursor(session: Session, seq: int, stream_name: str = STREAM_NAME) -> N
         session.add(row)
         return
 
-    row.last_seq = seq
+    if seq > row.last_seq:
+        row.last_seq = seq
