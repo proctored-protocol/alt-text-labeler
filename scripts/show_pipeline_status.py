@@ -43,6 +43,7 @@ def collect_process_info() -> dict[str, Any]:
     firehose = []
     enqueue = []
     apply = []
+    verify = []
 
     worker_id_pattern = re.compile(r"--worker-id\s+(\S+)")
 
@@ -62,6 +63,17 @@ def collect_process_info() -> dict[str, Any]:
                     "worker_id": worker_id,
                 }
             )
+        elif "scripts/run_label_verify_worker.py" in line:
+            worker_id = None
+            match = worker_id_pattern.search(line)
+            if match:
+                worker_id = match.group(1)
+            verify.append(
+                {
+                    "line": line.strip(),
+                    "worker_id": worker_id,
+                }
+            )
 
     return {
         "firehose_intake_count": len(firehose),
@@ -69,6 +81,10 @@ def collect_process_info() -> dict[str, Any]:
         "label_apply_count": len(apply),
         "label_apply_worker_ids": sorted(
             [item["worker_id"] for item in apply if item["worker_id"]]
+        ),
+        "label_verify_count": len(verify),
+        "label_verify_worker_ids": sorted(
+            [item["worker_id"] for item in verify if item["worker_id"]]
         ),
     }
 
@@ -95,21 +111,33 @@ def main() -> None:
                     COUNT(*) FILTER (
                         WHERE created_at >= NOW() - INTERVAL '10 minutes'
                     ) AS queued_last_10m,
+
                     COUNT(*) FILTER (
-                        WHERE state = 'published'
+                        WHERE ozone_created_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS emitted_last_10m,
+
+                    COUNT(*) FILTER (
+                        WHERE label_visible_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS verified_last_10m,
+
+                    COUNT(*) FILTER (
+                        WHERE state = 'verification_failed'
                           AND updated_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS published_last_10m,
+                    ) AS verification_failed_last_10m,
+
                     COUNT(*) FILTER (
                         WHERE state = 'dead'
                           AND updated_at >= NOW() - INTERVAL '10 minutes'
                     ) AS dead_last_10m,
+
                     COUNT(*) FILTER (
                         WHERE final_forced_found_label IS TRUE
-                          AND updated_at >= NOW() - INTERVAL '10 minutes'
+                          AND label_visible_at >= NOW() - INTERVAL '10 minutes'
                     ) AS forced_visible_last_10m,
+
                     COUNT(*) FILTER (
                         WHERE final_query_found_label IS TRUE
-                          AND updated_at >= NOW() - INTERVAL '10 minutes'
+                          AND label_visible_at >= NOW() - INTERVAL '10 minutes'
                     ) AS query_visible_last_10m
                 FROM label_work_item
                 """
@@ -123,21 +151,33 @@ def main() -> None:
                     COUNT(*) FILTER (
                         WHERE created_at >= NOW() - INTERVAL '60 minutes'
                     ) AS queued_last_60m,
+
                     COUNT(*) FILTER (
-                        WHERE state = 'published'
+                        WHERE ozone_created_at >= NOW() - INTERVAL '60 minutes'
+                    ) AS emitted_last_60m,
+
+                    COUNT(*) FILTER (
+                        WHERE label_visible_at >= NOW() - INTERVAL '60 minutes'
+                    ) AS verified_last_60m,
+
+                    COUNT(*) FILTER (
+                        WHERE state = 'verification_failed'
                           AND updated_at >= NOW() - INTERVAL '60 minutes'
-                    ) AS published_last_60m,
+                    ) AS verification_failed_last_60m,
+
                     COUNT(*) FILTER (
                         WHERE state = 'dead'
                           AND updated_at >= NOW() - INTERVAL '60 minutes'
                     ) AS dead_last_60m,
+
                     COUNT(*) FILTER (
                         WHERE final_forced_found_label IS TRUE
-                          AND updated_at >= NOW() - INTERVAL '60 minutes'
+                          AND label_visible_at >= NOW() - INTERVAL '60 minutes'
                     ) AS forced_visible_last_60m,
+
                     COUNT(*) FILTER (
                         WHERE final_query_found_label IS TRUE
-                          AND updated_at >= NOW() - INTERVAL '60 minutes'
+                          AND label_visible_at >= NOW() - INTERVAL '60 minutes'
                     ) AS query_visible_last_60m
                 FROM label_work_item
                 """
@@ -153,7 +193,7 @@ def main() -> None:
                     MIN(leased_until) AS earliest_lease_expiry,
                     MAX(updated_at) AS latest_update
                 FROM label_work_item
-                WHERE state = 'leased'
+                WHERE state IN ('leased', 'verifying')
                 GROUP BY leased_by
                 ORDER BY leased_by
                 """
@@ -200,9 +240,13 @@ def main() -> None:
                 SELECT
                     MIN(record_created_at) FILTER (WHERE state = 'queued') AS oldest_queued_record_created_at,
                     MAX(record_created_at) FILTER (WHERE state = 'queued') AS newest_queued_record_created_at,
-                    MAX(record_created_at) FILTER (WHERE state = 'published') AS newest_published_record_created_at,
+                    MAX(record_created_at) FILTER (WHERE state = 'published') AS newest_verified_record_created_at,
+                    MAX(record_created_at) FILTER (WHERE state = 'published_pending_verification') AS newest_pending_verification_record_created_at,
                     COUNT(*) FILTER (WHERE state = 'queued') AS queued_count,
-                    COUNT(*) FILTER (WHERE state = 'published') AS published_count
+                    COUNT(*) FILTER (WHERE state = 'published_pending_verification') AS pending_verification_count,
+                    COUNT(*) FILTER (WHERE state = 'verifying') AS verifying_count,
+                    COUNT(*) FILTER (WHERE state = 'verification_failed') AS verification_failed_count,
+                    COUNT(*) FILTER (WHERE state = 'published') AS verified_count
                 FROM label_work_item
                 """
             )
@@ -219,7 +263,7 @@ def main() -> None:
                     last_error,
                     updated_at
                 FROM label_work_item
-                WHERE state = 'dead'
+                WHERE state IN ('dead', 'verification_failed')
                    OR (last_error IS NOT NULL AND last_error <> '')
                 ORDER BY updated_at DESC
                 LIMIT 10
@@ -237,6 +281,7 @@ def main() -> None:
                     label_value,
                     state,
                     ozone_created_at,
+                    label_visible_at,
                     final_forced_found_label,
                     final_query_found_label,
                     manual_success,

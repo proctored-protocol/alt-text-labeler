@@ -10,13 +10,7 @@ from typing import Any
 from sqlalchemy import text
 
 from app.db import SessionLocal
-from scripts.manual_publish_and_verify import (
-    HTTPJSONError,
-    ScriptSettings,
-    publish_label_via_ozone,
-    summarize_snapshot,
-    verify_once,
-)
+from scripts.manual_publish_and_verify import HTTPJSONError, publish_label_via_ozone
 
 
 def utc_now() -> datetime:
@@ -36,11 +30,6 @@ def truncate_error(value: str, limit: int = 1200) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "...[truncated]"
-
-
-def is_not_found_error(exc: Exception) -> bool:
-    msg = str(exc)
-    return "getPosts returned no posts for" in msg
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
@@ -129,41 +118,16 @@ def lease_label_work_items(
     return [dict(row) for row in rows]
 
 
-def extract_final_fields(final_summary: dict[str, Any] | None) -> dict[str, Any]:
-    summary = final_summary or {}
-    query_labels = summary.get("query_labels") or {}
-    forced_hydration = summary.get("forced_hydration") or {}
-    subscriber_hydration = summary.get("subscriber_hydration") or {}
-
-    return {
-        "final_forced_status_code": forced_hydration.get("status_code"),
-        "final_query_status_code": query_labels.get("status_code"),
-        "final_subscriber_status_code": subscriber_hydration.get("status_code"),
-        "final_forced_found_label": forced_hydration.get("found_label"),
-        "final_query_found_label": query_labels.get("found_label"),
-        "final_subscriber_found_label": subscriber_hydration.get("found_label"),
-    }
-
-
-def verification_succeeded(final_summary: dict[str, Any] | None) -> bool:
-    summary = final_summary or {}
-    query_ok = ((summary.get("query_labels") or {}).get("found_label") is True)
-    forced_ok = ((summary.get("forced_hydration") or {}).get("found_label") is True)
-    return query_ok and forced_ok
-
-
-def mark_label_work_item_published(
+def mark_label_work_item_emitted(
     *,
     session,
     work_item_id: int,
     ozone_response: dict[str, Any],
-    final_summary: dict[str, Any],
+    verification_delay_seconds: int,
 ) -> None:
-    fields = extract_final_fields(final_summary)
     raw_result = {
-        "success": True,
+        "phase": "emitted",
         "ozone_response": ozone_response,
-        "final_summary": final_summary,
     }
 
     session.execute(
@@ -171,19 +135,12 @@ def mark_label_work_item_published(
             """
             UPDATE label_work_item
             SET
-                state = 'published',
+                state = 'published_pending_verification',
                 leased_until = NULL,
                 leased_by = NULL,
+                next_attempt_at = NOW() + (:verification_delay_seconds * INTERVAL '1 second'),
                 ozone_event_id = :ozone_event_id,
                 ozone_created_at = :ozone_created_at,
-                final_forced_status_code = :final_forced_status_code,
-                final_query_status_code = :final_query_status_code,
-                final_subscriber_status_code = :final_subscriber_status_code,
-                final_forced_found_label = :final_forced_found_label,
-                final_query_found_label = :final_query_found_label,
-                final_subscriber_found_label = :final_subscriber_found_label,
-                manual_success = TRUE,
-                label_visible_at = NOW(),
                 last_error = NULL,
                 raw_result_json = :raw_result_json,
                 updated_at = NOW()
@@ -192,14 +149,9 @@ def mark_label_work_item_published(
         ),
         {
             "work_item_id": work_item_id,
+            "verification_delay_seconds": verification_delay_seconds,
             "ozone_event_id": ozone_response.get("id"),
             "ozone_created_at": ozone_response.get("createdAt"),
-            "final_forced_status_code": fields["final_forced_status_code"],
-            "final_query_status_code": fields["final_query_status_code"],
-            "final_subscriber_status_code": fields["final_subscriber_status_code"],
-            "final_forced_found_label": fields["final_forced_found_label"],
-            "final_query_found_label": fields["final_query_found_label"],
-            "final_subscriber_found_label": fields["final_subscriber_found_label"],
             "raw_result_json": json.dumps(raw_result, ensure_ascii=False, default=str),
         },
     )
@@ -211,15 +163,10 @@ def mark_label_work_item_retry(
     work_item_id: int,
     error_text: str,
     delay_seconds: int,
-    ozone_response: dict[str, Any] | None = None,
-    final_summary: dict[str, Any] | None = None,
 ) -> None:
-    fields = extract_final_fields(final_summary)
     raw_result = {
-        "success": False,
+        "phase": "publish_failed",
         "error": error_text,
-        "ozone_response": ozone_response,
-        "final_summary": final_summary,
     }
 
     session.execute(
@@ -231,15 +178,6 @@ def mark_label_work_item_retry(
                 leased_until = NULL,
                 leased_by = NULL,
                 next_attempt_at = NOW() + (:delay_seconds * INTERVAL '1 second'),
-                ozone_event_id = COALESCE(:ozone_event_id, ozone_event_id),
-                ozone_created_at = COALESCE(:ozone_created_at, ozone_created_at),
-                final_forced_status_code = COALESCE(:final_forced_status_code, final_forced_status_code),
-                final_query_status_code = COALESCE(:final_query_status_code, final_query_status_code),
-                final_subscriber_status_code = COALESCE(:final_subscriber_status_code, final_subscriber_status_code),
-                final_forced_found_label = COALESCE(:final_forced_found_label, final_forced_found_label),
-                final_query_found_label = COALESCE(:final_query_found_label, final_query_found_label),
-                final_subscriber_found_label = COALESCE(:final_subscriber_found_label, final_subscriber_found_label),
-                manual_success = FALSE,
                 last_error = :last_error,
                 raw_result_json = :raw_result_json,
                 updated_at = NOW()
@@ -249,14 +187,6 @@ def mark_label_work_item_retry(
         {
             "work_item_id": work_item_id,
             "delay_seconds": delay_seconds,
-            "ozone_event_id": (ozone_response or {}).get("id"),
-            "ozone_created_at": (ozone_response or {}).get("createdAt"),
-            "final_forced_status_code": fields["final_forced_status_code"],
-            "final_query_status_code": fields["final_query_status_code"],
-            "final_subscriber_status_code": fields["final_subscriber_status_code"],
-            "final_forced_found_label": fields["final_forced_found_label"],
-            "final_query_found_label": fields["final_query_found_label"],
-            "final_subscriber_found_label": fields["final_subscriber_found_label"],
             "last_error": truncate_error(error_text),
             "raw_result_json": json.dumps(raw_result, ensure_ascii=False, default=str),
         },
@@ -269,6 +199,11 @@ def mark_label_work_item_dead(
     work_item_id: int,
     error_text: str,
 ) -> None:
+    raw_result = {
+        "phase": "publish_dead",
+        "error": error_text,
+    }
+
     session.execute(
         text(
             """
@@ -279,6 +214,7 @@ def mark_label_work_item_dead(
                 leased_by = NULL,
                 manual_success = FALSE,
                 last_error = :last_error,
+                raw_result_json = :raw_result_json,
                 updated_at = NOW()
             WHERE id = :work_item_id
             """
@@ -286,18 +222,17 @@ def mark_label_work_item_dead(
         {
             "work_item_id": work_item_id,
             "last_error": truncate_error(error_text),
+            "raw_result_json": json.dumps(raw_result, ensure_ascii=False, default=str),
         },
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Lease label_work_item rows and publish labels in-process.")
+    parser = argparse.ArgumentParser(description="Lease label_work_item rows and emit labels only.")
     parser.add_argument("--worker-id", default=f"apply-{socket.gethostname()}")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lease-seconds", type=int, default=180)
-    parser.add_argument("--verify-timeout-seconds", type=int, default=10)
-    parser.add_argument("--verify-interval-seconds", type=int, default=1)
-    parser.add_argument("--request-timeout-seconds", type=int, default=30)
+    parser.add_argument("--verification-delay-seconds", type=int, default=30)
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--backoff-base-seconds", type=int, default=15)
     parser.add_argument("--rate-limit-cooldown-seconds", type=int, default=60)
@@ -305,9 +240,6 @@ def main() -> None:
     parser.add_argument("--publish-sleep-seconds", type=float, default=0.25)
     parser.add_argument("--idle-sleep-seconds", type=float, default=1.0)
     args = parser.parse_args()
-
-    script_settings = ScriptSettings()
-    labeler_did = script_settings.verifier_labeler_did
 
     cooldown_until = 0.0
 
@@ -318,9 +250,7 @@ def main() -> None:
             "worker_id": args.worker_id,
             "batch_size": args.batch_size,
             "lease_seconds": args.lease_seconds,
-            "verify_timeout_seconds": args.verify_timeout_seconds,
-            "verify_interval_seconds": args.verify_interval_seconds,
-            "request_timeout_seconds": args.request_timeout_seconds,
+            "verification_delay_seconds": args.verification_delay_seconds,
             "max_attempts": args.max_attempts,
             "backoff_base_seconds": args.backoff_base_seconds,
             "rate_limit_cooldown_seconds": args.rate_limit_cooldown_seconds,
@@ -372,9 +302,6 @@ def main() -> None:
                 }
             )
 
-            ozone_response: dict[str, Any] | None = None
-            final_summary: dict[str, Any] | None = None
-
             try:
                 ozone_response = publish_label_via_ozone(
                     at_uri=at_uri,
@@ -382,62 +309,56 @@ def main() -> None:
                     label_value=label_value,
                 )
 
-                deadline = time.monotonic() + args.verify_timeout_seconds
-                while True:
-                    snapshot = verify_once(
-                        at_uri=at_uri,
-                        label_value=label_value,
-                        labeler_did=labeler_did,
-                        timeout=args.request_timeout_seconds,
-                        skip_forced_check=False,
-                        skip_subscriber_check=True,
+                with SessionLocal() as session:
+                    mark_label_work_item_emitted(
+                        session=session,
+                        work_item_id=work_item_id,
+                        ozone_response=ozone_response,
+                        verification_delay_seconds=args.verification_delay_seconds,
                     )
-                    final_summary = summarize_snapshot(snapshot)
+                    session.commit()
 
-                    if verification_succeeded(final_summary):
-                        break
-
-                    if time.monotonic() >= deadline:
-                        break
-
-                    time.sleep(args.verify_interval_seconds)
+                print_json_line(
+                    {
+                        "event": "label_apply_emitted",
+                        "checked_at": iso_now(),
+                        "worker_id": args.worker_id,
+                        "work_item_id": work_item_id,
+                        "post_url": post_url,
+                        "post_uri": at_uri,
+                        "label_value": label_value,
+                        "ozone_event_id": ozone_response.get("id"),
+                        "ozone_created_at": ozone_response.get("createdAt"),
+                    }
+                )
 
             except Exception as exc:
                 error_text = str(exc)
                 rate_limited = is_rate_limit_error(exc)
 
                 with SessionLocal() as session:
-                    if is_not_found_error(exc):
+                    if attempt_count >= args.max_attempts:
                         mark_label_work_item_dead(
                             session=session,
                             work_item_id=work_item_id,
                             error_text=error_text,
                         )
                     else:
-                        if attempt_count >= args.max_attempts:
-                            mark_label_work_item_dead(
-                                session=session,
-                                work_item_id=work_item_id,
-                                error_text=error_text,
-                            )
-                        else:
-                            base_seconds = args.backoff_base_seconds
-                            if rate_limited:
-                                base_seconds *= args.rate_limit_backoff_multiplier
+                        base_seconds = args.backoff_base_seconds
+                        if rate_limited:
+                            base_seconds *= args.rate_limit_backoff_multiplier
 
-                            delay_seconds = next_backoff_seconds(
-                                attempt_count_after_failure=attempt_count,
-                                base_seconds=base_seconds,
-                            )
+                        delay_seconds = next_backoff_seconds(
+                            attempt_count_after_failure=attempt_count,
+                            base_seconds=base_seconds,
+                        )
 
-                            mark_label_work_item_retry(
-                                session=session,
-                                work_item_id=work_item_id,
-                                error_text=error_text,
-                                delay_seconds=delay_seconds,
-                                ozone_response=ozone_response,
-                                final_summary=final_summary,
-                            )
+                        mark_label_work_item_retry(
+                            session=session,
+                            work_item_id=work_item_id,
+                            error_text=error_text,
+                            delay_seconds=delay_seconds,
+                        )
                     session.commit()
 
                 if rate_limited:
@@ -479,71 +400,6 @@ def main() -> None:
                     break
 
                 continue
-
-            if verification_succeeded(final_summary):
-                with SessionLocal() as session:
-                    mark_label_work_item_published(
-                        session=session,
-                        work_item_id=work_item_id,
-                        ozone_response=ozone_response or {},
-                        final_summary=final_summary or {},
-                    )
-                    session.commit()
-
-                print_json_line(
-                    {
-                        "event": "label_apply_succeeded",
-                        "checked_at": iso_now(),
-                        "worker_id": args.worker_id,
-                        "work_item_id": work_item_id,
-                        "post_url": post_url,
-                        "post_uri": at_uri,
-                        "label_value": label_value,
-                        "ozone_event_id": (ozone_response or {}).get("id"),
-                        "ozone_created_at": (ozone_response or {}).get("createdAt"),
-                        "final_summary": final_summary,
-                    }
-                )
-            else:
-                error_text = "verification_unsuccessful"
-
-                with SessionLocal() as session:
-                    if attempt_count >= args.max_attempts:
-                        mark_label_work_item_dead(
-                            session=session,
-                            work_item_id=work_item_id,
-                            error_text=error_text,
-                        )
-                    else:
-                        delay_seconds = next_backoff_seconds(
-                            attempt_count_after_failure=attempt_count,
-                            base_seconds=args.backoff_base_seconds,
-                        )
-                        mark_label_work_item_retry(
-                            session=session,
-                            work_item_id=work_item_id,
-                            error_text=error_text,
-                            delay_seconds=delay_seconds,
-                            ozone_response=ozone_response,
-                            final_summary=final_summary,
-                        )
-                    session.commit()
-
-                print_json_line(
-                    {
-                        "event": "label_apply_retry_scheduled",
-                        "checked_at": iso_now(),
-                        "worker_id": args.worker_id,
-                        "work_item_id": work_item_id,
-                        "post_url": post_url,
-                        "post_uri": at_uri,
-                        "label_value": label_value,
-                        "ozone_event_id": (ozone_response or {}).get("id"),
-                        "ozone_created_at": (ozone_response or {}).get("createdAt"),
-                        "final_summary": final_summary,
-                        "error": error_text,
-                    }
-                )
 
             if args.publish_sleep_seconds > 0:
                 time.sleep(args.publish_sleep_seconds)

@@ -45,11 +45,23 @@ def main() -> None:
             text(
                 """
                 SELECT
-                    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '10 minutes') AS queued_last_10m,
                     COUNT(*) FILTER (
-                        WHERE state = 'published'
+                        WHERE created_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS queued_last_10m,
+
+                    COUNT(*) FILTER (
+                        WHERE ozone_created_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS emitted_last_10m,
+
+                    COUNT(*) FILTER (
+                        WHERE label_visible_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS verified_last_10m,
+
+                    COUNT(*) FILTER (
+                        WHERE state = 'verification_failed'
                           AND updated_at >= NOW() - INTERVAL '10 minutes'
-                    ) AS published_last_10m,
+                    ) AS verification_failed_last_10m,
+
                     COUNT(*) FILTER (
                         WHERE state = 'dead'
                           AND updated_at >= NOW() - INTERVAL '10 minutes'
@@ -59,17 +71,18 @@ def main() -> None:
             )
         ).mappings().one()
 
-        verification_stats_10m = conn.execute(
+        visibility_stats_10m = conn.execute(
             text(
                 """
                 SELECT
                     COUNT(*) FILTER (
                         WHERE final_forced_found_label IS TRUE
-                          AND updated_at >= NOW() - INTERVAL '10 minutes'
+                          AND label_visible_at >= NOW() - INTERVAL '10 minutes'
                     ) AS forced_visible_last_10m,
+
                     COUNT(*) FILTER (
                         WHERE final_query_found_label IS TRUE
-                          AND updated_at >= NOW() - INTERVAL '10 minutes'
+                          AND label_visible_at >= NOW() - INTERVAL '10 minutes'
                     ) AS query_visible_last_10m
                 FROM label_work_item
                 """
@@ -85,7 +98,7 @@ def main() -> None:
                     MIN(leased_until) AS earliest_lease_expiry,
                     MAX(updated_at) AS latest_update
                 FROM label_work_item
-                WHERE state = 'leased'
+                WHERE state IN ('leased', 'verifying')
                 GROUP BY leased_by
                 ORDER BY leased_by
                 """
@@ -102,6 +115,7 @@ def main() -> None:
                     label_value,
                     state,
                     ozone_created_at,
+                    label_visible_at,
                     final_forced_found_label,
                     final_query_found_label,
                     manual_success,
@@ -126,7 +140,7 @@ def main() -> None:
 
     print_section("10-minute throughput")
     print(dict(throughput_10m))
-    print(dict(verification_stats_10m))
+    print(dict(visibility_stats_10m))
 
     print_section("leased jobs by worker")
     if worker_leases:
