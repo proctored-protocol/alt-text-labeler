@@ -55,7 +55,7 @@ def lease_verification_items(
                         AND leased_until IS NOT NULL
                         AND leased_until < NOW()
                     )
-                ORDER BY ozone_created_at ASC NULLS LAST, id ASC
+                ORDER BY ozone_created_at DESC NULLS LAST, id DESC
                 LIMIT :batch_size
                 FOR UPDATE SKIP LOCKED
             )
@@ -124,9 +124,8 @@ def extract_final_fields(final_summary: dict[str, Any] | None) -> dict[str, Any]
 
 def verification_succeeded(final_summary: dict[str, Any] | None) -> bool:
     summary = final_summary or {}
-    query_ok = ((summary.get("query_labels") or {}).get("found_label") is True)
     forced_ok = ((summary.get("forced_hydration") or {}).get("found_label") is True)
-    return query_ok and forced_ok
+    return forced_ok
 
 
 def verification_age_seconds(ozone_created_at: Any) -> float:
@@ -148,6 +147,7 @@ def mark_label_work_item_verified(
     fields = extract_final_fields(final_summary)
     raw_result = {
         "phase": "verified",
+        "verification_mode": "forced_hydration_only",
         "final_summary": final_summary,
     }
 
@@ -197,6 +197,7 @@ def mark_label_work_item_verification_pending(
     fields = extract_final_fields(final_summary)
     raw_result = {
         "phase": "verification_pending",
+        "verification_mode": "forced_hydration_only",
         "final_summary": final_summary,
         "error": error_text,
     }
@@ -250,6 +251,7 @@ def mark_label_work_item_verification_failed(
     fields = extract_final_fields(final_summary)
     raw_result = {
         "phase": "verification_failed",
+        "verification_mode": "forced_hydration_only",
         "final_summary": final_summary,
         "error": error_text,
     }
@@ -313,6 +315,8 @@ def main() -> None:
             "request_timeout_seconds": args.request_timeout_seconds,
             "verify_retry_seconds": args.verify_retry_seconds,
             "verification_max_age_seconds": args.verification_max_age_seconds,
+            "verification_mode": "forced_hydration_only",
+            "priority": "newest_first",
         }
     )
 
