@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import socket
 import time
 from datetime import datetime, timezone
@@ -32,16 +33,87 @@ def truncate_error(value: str, limit: int = 1200) -> str:
     return value[:limit] + "...[truncated]"
 
 
+def next_retry_delay_seconds(*, base_seconds: int, jitter_seconds: int) -> int:
+    jitter_seconds = max(0, jitter_seconds)
+    low = max(1, base_seconds - jitter_seconds)
+    high = max(low, base_seconds + jitter_seconds)
+    return random.randint(low, high)
+
+
+def choose_order_clause(
+    *,
+    priority: str,
+    batch_counter: int,
+    hybrid_sweep_every_batches: int,
+) -> tuple[str, str]:
+    if priority == "newest":
+        return "ozone_created_at DESC NULLS LAST, id DESC", "newest"
+
+    if priority == "oldest":
+        return "ozone_created_at ASC NULLS LAST, id ASC", "oldest"
+
+    sweep_every = max(1, hybrid_sweep_every_batches)
+    if batch_counter % sweep_every == 0:
+        return "ozone_created_at ASC NULLS LAST, id ASC", "oldest"
+
+    return "ozone_created_at DESC NULLS LAST, id DESC", "newest"
+
+
+def expire_overdue_verification_items(
+    *,
+    session,
+    max_age_seconds: int,
+    limit: int,
+) -> int:
+    rows = session.execute(
+        text(
+            """
+            WITH candidates AS (
+                SELECT id
+                FROM label_work_item
+                WHERE state IN ('published_pending_verification', 'verifying')
+                  AND ozone_created_at IS NOT NULL
+                  AND ozone_created_at <= NOW() - (:max_age_seconds * INTERVAL '1 second')
+                ORDER BY ozone_created_at ASC NULLS LAST, id ASC
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE label_work_item AS lwi
+            SET
+                state = 'verification_failed',
+                leased_until = NULL,
+                leased_by = NULL,
+                manual_success = FALSE,
+                last_error = CASE
+                    WHEN lwi.last_error IS NULL OR lwi.last_error = '' THEN 'verification_expired'
+                    ELSE lwi.last_error
+                END,
+                updated_at = NOW()
+            FROM candidates
+            WHERE lwi.id = candidates.id
+            RETURNING lwi.id
+            """
+        ),
+        {
+            "max_age_seconds": max_age_seconds,
+            "limit": limit,
+        },
+    ).mappings().all()
+
+    return len(rows)
+
+
 def lease_verification_items(
     *,
     session,
     worker_id: str,
     batch_size: int,
     lease_seconds: int,
+    order_clause: str,
 ) -> list[dict[str, Any]]:
     rows = session.execute(
         text(
-            """
+            f"""
             WITH candidates AS (
                 SELECT id
                 FROM label_work_item
@@ -55,7 +127,7 @@ def lease_verification_items(
                         AND leased_until IS NOT NULL
                         AND leased_until < NOW()
                     )
-                ORDER BY ozone_created_at DESC NULLS LAST, id DESC
+                ORDER BY {order_clause}
                 LIMIT :batch_size
                 FOR UPDATE SKIP LOCKED
             )
@@ -200,6 +272,7 @@ def mark_label_work_item_verification_pending(
         "verification_mode": "forced_hydration_only",
         "final_summary": final_summary,
         "error": error_text,
+        "retry_delay_seconds": delay_seconds,
     }
 
     session.execute(
@@ -295,7 +368,12 @@ def main() -> None:
     parser.add_argument("--lease-seconds", type=int, default=180)
     parser.add_argument("--request-timeout-seconds", type=int, default=30)
     parser.add_argument("--verify-retry-seconds", type=int, default=30)
+    parser.add_argument("--verify-retry-jitter-seconds", type=int, default=10)
     parser.add_argument("--verification-max-age-seconds", type=int, default=1800)
+    parser.add_argument("--expired-sweep-batch-size", type=int, default=25)
+    parser.add_argument("--priority", choices=["newest", "oldest", "hybrid"], default="hybrid")
+    parser.add_argument("--hybrid-sweep-every-batches", type=int, default=10)
+    parser.add_argument("--include-query-check", action="store_true")
     parser.add_argument("--idle-sleep-seconds", type=float, default=1.0)
     args = parser.parse_args()
 
@@ -311,19 +389,51 @@ def main() -> None:
             "lease_seconds": args.lease_seconds,
             "request_timeout_seconds": args.request_timeout_seconds,
             "verify_retry_seconds": args.verify_retry_seconds,
+            "verify_retry_jitter_seconds": args.verify_retry_jitter_seconds,
             "verification_max_age_seconds": args.verification_max_age_seconds,
-            "verification_mode": "forced_hydration_only",
-            "priority": "newest_first",
+            "expired_sweep_batch_size": args.expired_sweep_batch_size,
+            "verification_mode": "forced_hydration_only" if not args.include_query_check else "forced_plus_query",
+            "priority": args.priority,
+            "hybrid_sweep_every_batches": args.hybrid_sweep_every_batches,
         }
     )
 
+    batch_counter = 0
+
     while True:
+        with SessionLocal() as session:
+            expired_count = expire_overdue_verification_items(
+                session=session,
+                max_age_seconds=args.verification_max_age_seconds,
+                limit=args.expired_sweep_batch_size,
+            )
+            session.commit()
+
+        if expired_count:
+            print_json_line(
+                {
+                    "event": "label_verify_expired_items_failed",
+                    "checked_at": iso_now(),
+                    "worker_id": args.worker_id,
+                    "expired_count": expired_count,
+                    "verification_max_age_seconds": args.verification_max_age_seconds,
+                }
+            )
+
+        batch_counter += 1
+        order_clause, effective_priority = choose_order_clause(
+            priority=args.priority,
+            batch_counter=batch_counter,
+            hybrid_sweep_every_batches=args.hybrid_sweep_every_batches,
+        )
+
         with SessionLocal() as session:
             jobs = lease_verification_items(
                 session=session,
                 worker_id=args.worker_id,
                 batch_size=args.batch_size,
                 lease_seconds=args.lease_seconds,
+                order_clause=order_clause,
             )
             session.commit()
 
@@ -348,6 +458,7 @@ def main() -> None:
                     "post_uri": at_uri,
                     "label_value": label_value,
                     "ozone_created_at": ozone_created_at,
+                    "effective_priority": effective_priority,
                 }
             )
 
@@ -359,6 +470,7 @@ def main() -> None:
                     label_value=label_value,
                     labeler_did=labeler_did,
                     timeout=args.request_timeout_seconds,
+                    skip_query_check=not args.include_query_check,
                     skip_forced_check=False,
                     skip_subscriber_check=True,
                 )
@@ -383,6 +495,7 @@ def main() -> None:
                             "post_uri": at_uri,
                             "label_value": label_value,
                             "final_summary": final_summary,
+                            "effective_priority": effective_priority,
                         }
                     )
                     continue
@@ -410,16 +523,22 @@ def main() -> None:
                             "age_seconds": age_seconds,
                             "final_summary": final_summary,
                             "error": "verification_unsuccessful",
+                            "effective_priority": effective_priority,
                         }
                     )
                     continue
+
+                delay_seconds = next_retry_delay_seconds(
+                    base_seconds=args.verify_retry_seconds,
+                    jitter_seconds=args.verify_retry_jitter_seconds,
+                )
 
                 with SessionLocal() as session:
                     mark_label_work_item_verification_pending(
                         session=session,
                         work_item_id=work_item_id,
                         final_summary=final_summary,
-                        delay_seconds=args.verify_retry_seconds,
+                        delay_seconds=delay_seconds,
                         error_text=None,
                     )
                     session.commit()
@@ -434,7 +553,9 @@ def main() -> None:
                         "post_uri": at_uri,
                         "label_value": label_value,
                         "age_seconds": age_seconds,
+                        "retry_delay_seconds": delay_seconds,
                         "final_summary": final_summary,
+                        "effective_priority": effective_priority,
                     }
                 )
 
@@ -442,22 +563,45 @@ def main() -> None:
                 error_text = str(exc)
                 age_seconds = verification_age_seconds(ozone_created_at)
 
-                with SessionLocal() as session:
-                    if age_seconds >= args.verification_max_age_seconds:
+                if age_seconds >= args.verification_max_age_seconds:
+                    with SessionLocal() as session:
                         mark_label_work_item_verification_failed(
                             session=session,
                             work_item_id=work_item_id,
                             final_summary=final_summary,
                             error_text=error_text,
                         )
-                    else:
-                        mark_label_work_item_verification_pending(
-                            session=session,
-                            work_item_id=work_item_id,
-                            final_summary=final_summary,
-                            delay_seconds=args.verify_retry_seconds,
-                            error_text=error_text,
-                        )
+                        session.commit()
+
+                    print_json_line(
+                        {
+                            "event": "label_verify_failed_terminal",
+                            "checked_at": iso_now(),
+                            "worker_id": args.worker_id,
+                            "work_item_id": work_item_id,
+                            "post_url": post_url,
+                            "post_uri": at_uri,
+                            "label_value": label_value,
+                            "age_seconds": age_seconds,
+                            "error": truncate_error(error_text),
+                            "effective_priority": effective_priority,
+                        }
+                    )
+                    continue
+
+                delay_seconds = next_retry_delay_seconds(
+                    base_seconds=args.verify_retry_seconds,
+                    jitter_seconds=args.verify_retry_jitter_seconds,
+                )
+
+                with SessionLocal() as session:
+                    mark_label_work_item_verification_pending(
+                        session=session,
+                        work_item_id=work_item_id,
+                        final_summary=final_summary,
+                        delay_seconds=delay_seconds,
+                        error_text=error_text,
+                    )
                     session.commit()
 
                 print_json_line(
@@ -470,7 +614,9 @@ def main() -> None:
                         "post_uri": at_uri,
                         "label_value": label_value,
                         "age_seconds": age_seconds,
+                        "retry_delay_seconds": delay_seconds,
                         "error": truncate_error(error_text),
+                        "effective_priority": effective_priority,
                     }
                 )
 

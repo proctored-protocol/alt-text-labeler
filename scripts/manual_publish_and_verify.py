@@ -7,9 +7,9 @@ import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -127,6 +127,23 @@ def parse_post_url(post_url: str) -> tuple[str, str]:
     return profile_token, rkey
 
 
+def parse_at_uri(at_uri: str) -> tuple[str, str]:
+    prefix = "at://"
+    if not at_uri.startswith(prefix):
+        raise ValueError(f"Unexpected AT URI: {at_uri}")
+
+    rest = at_uri[len(prefix):]
+    parts = rest.split("/")
+    if len(parts) != 3:
+        raise ValueError(f"Unexpected AT URI shape: {at_uri}")
+
+    did, collection, rkey = parts
+    if collection != "app.bsky.feed.post":
+        raise ValueError(f"Unexpected collection in URI: {at_uri}")
+
+    return did, rkey
+
+
 def resolve_profile_token_to_did(profile_token: str, *, timeout: int) -> str:
     if profile_token.startswith("did:"):
         return profile_token
@@ -165,6 +182,30 @@ def resolve_post(post_url: str, *, timeout: int) -> ResolvedPost:
         profile_token=profile_token,
         rkey=rkey,
         did=did,
+        at_uri=at_uri,
+        cid=cid,
+    )
+
+
+def resolve_post_from_known_values(
+    *,
+    post_url: str,
+    at_uri: str,
+    cid: str,
+) -> ResolvedPost:
+    profile_token, rkey_from_url = parse_post_url(post_url)
+    did_from_uri, rkey_from_uri = parse_at_uri(at_uri)
+
+    if rkey_from_url != rkey_from_uri:
+        raise ValueError(
+            f"post_url rkey {rkey_from_url} does not match at_uri rkey {rkey_from_uri}"
+        )
+
+    return ResolvedPost(
+        post_url=post_url,
+        profile_token=profile_token,
+        rkey=rkey_from_uri,
+        did=did_from_uri,
         at_uri=at_uri,
         cid=cid,
     )
@@ -326,10 +367,21 @@ def verify_once(
     label_value: str,
     labeler_did: str,
     timeout: int,
+    skip_query_check: bool,
     skip_forced_check: bool,
     skip_subscriber_check: bool,
 ) -> VerificationSnapshot:
-    ql = query_labels(at_uri=at_uri, labeler_did=labeler_did, timeout=timeout)
+    if skip_query_check:
+        ql = VisibilityResult(
+            ok=True,
+            status_code=0,
+            found_label=False,
+            response_headers={},
+            payload={"skipped": True},
+            error_text=None,
+        )
+    else:
+        ql = query_labels(at_uri=at_uri, labeler_did=labeler_did, timeout=timeout)
 
     if skip_forced_check:
         forced = VisibilityResult(
@@ -377,12 +429,14 @@ def verify_once(
 def verification_succeeded(
     snapshot: VerificationSnapshot,
     *,
+    require_query: bool,
     require_forced: bool,
     require_subscriber: bool,
 ) -> bool:
+    query_ok = True if not require_query else snapshot.query_labels.found_label
     forced_ok = True if not require_forced else snapshot.forced_hydration.found_label
     subscriber_ok = True if not require_subscriber else snapshot.subscriber_hydration.found_label
-    return snapshot.query_labels.found_label and forced_ok and subscriber_ok
+    return query_ok and forced_ok and subscriber_ok
 
 
 def summarize_snapshot(snapshot: VerificationSnapshot) -> dict[str, Any]:
@@ -455,6 +509,14 @@ def main() -> None:
         help="Label value to apply, e.g. missing-alt-text or partial-alt-text",
     )
     parser.add_argument(
+        "--at-uri",
+        help="Optional AT URI for the post. If supplied together with --cid, resolution via getPosts is skipped.",
+    )
+    parser.add_argument(
+        "--cid",
+        help="Optional CID for the post. Must be supplied together with --at-uri.",
+    )
+    parser.add_argument(
         "--verify-timeout-seconds",
         type=int,
         default=180,
@@ -473,6 +535,11 @@ def main() -> None:
         help="HTTP timeout for network requests.",
     )
     parser.add_argument(
+        "--skip-query-check",
+        action="store_true",
+        help="Skip queryLabels verification.",
+    )
+    parser.add_argument(
         "--skip-forced-check",
         action="store_true",
         help="Skip forced hydration verification.",
@@ -489,17 +556,29 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if bool(args.at_uri) != bool(args.cid):
+        raise ValueError("--at-uri and --cid must either both be supplied or both be omitted")
+
     script_settings = ScriptSettings()
     labeler_did = script_settings.verifier_labeler_did
 
     started_at = time.monotonic()
-    resolved = resolve_post(args.post_url, timeout=args.request_timeout_seconds)
+    if args.at_uri and args.cid:
+        resolved = resolve_post_from_known_values(
+            post_url=args.post_url,
+            at_uri=args.at_uri,
+            cid=args.cid,
+        )
+    else:
+        resolved = resolve_post(args.post_url, timeout=args.request_timeout_seconds)
+
     ozone_response = publish_label_via_ozone(
         at_uri=resolved.at_uri,
         cid=resolved.cid,
         label_value=args.label_value,
     )
 
+    require_query = not args.skip_query_check
     require_forced = not args.skip_forced_check
     require_subscriber = not args.skip_subscriber_check
 
@@ -514,6 +593,7 @@ def main() -> None:
             label_value=args.label_value,
             labeler_did=labeler_did,
             timeout=args.request_timeout_seconds,
+            skip_query_check=args.skip_query_check,
             skip_forced_check=args.skip_forced_check,
             skip_subscriber_check=args.skip_subscriber_check,
         )
@@ -526,6 +606,7 @@ def main() -> None:
 
         if verification_succeeded(
             snapshot,
+            require_query=require_query,
             require_forced=require_forced,
             require_subscriber=require_subscriber,
         ):
