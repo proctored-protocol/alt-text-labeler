@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from atproto import (
@@ -10,6 +11,7 @@ from atproto import (
 from app.config import get_settings
 from app.db import SessionLocal
 from app.parsing.posts import iter_post_creates
+from app.schemas import EvaluationResult
 from app.services.cursor import get_saved_cursor, save_cursor
 from app.services.evaluator import evaluate_post, upsert_post_evaluations
 from app.services.firehose_stats import bump_firehose_stats
@@ -23,6 +25,19 @@ class FirehoseWorker:
         self.settings = get_settings()
         self.client = None
 
+        self.flush_interval_seconds = float(
+            os.getenv("FIREHOSE_FLUSH_INTERVAL_SECONDS", "1.0")
+        )
+        self.max_pending_results = int(
+            os.getenv("FIREHOSE_MAX_PENDING_RESULTS", "1000")
+        )
+        self.max_pending_commits = int(
+            os.getenv("FIREHOSE_MAX_PENDING_COMMITS", "5000")
+        )
+
+        self._reset_pending()
+        self._last_flush_monotonic = time.monotonic()
+
         logger.info(
             "firehose_worker_initialized",
             extra={
@@ -32,8 +47,20 @@ class FirehoseWorker:
                 "publish_via_ozone": self.settings.publish_via_ozone,
                 "publish_mode": self.settings.publish_mode,
                 "mode": "evaluation_only",
+                "flush_interval_seconds": self.flush_interval_seconds,
+                "max_pending_results": self.max_pending_results,
+                "max_pending_commits": self.max_pending_commits,
             },
         )
+
+    def _reset_pending(self) -> None:
+        self._pending_results: list[EvaluationResult] = []
+        self._pending_commit_count = 0
+        self._pending_post_create_count = 0
+        self._pending_image_post_count = 0
+        self._pending_max_seq: int | None = None
+        self._pending_first_seq: int | None = None
+        self._pending_eval_error_count = 0
 
     def _build_client(self) -> FirehoseSubscribeReposClient:
         cursor = self.settings.firehose_cursor
@@ -66,6 +93,8 @@ class FirehoseWorker:
                 self.client = self._build_client()
                 self.client.start(self.on_message, self.on_callback_error)
 
+                self._flush_pending(reason="client_stopped")
+
                 logger.warning(
                     "firehose_client_stopped_reconnecting",
                     extra={"reconnect_delay_seconds": reconnect_delay_seconds},
@@ -73,17 +102,20 @@ class FirehoseWorker:
                 time.sleep(reconnect_delay_seconds)
 
             except Exception as exc:
-                error_text = str(exc)
+                logger.exception("firehose_worker_crashed_reconnecting")
 
+                try:
+                    self._flush_pending(reason="worker_exception")
+                except Exception:
+                    logger.exception("firehose_pending_flush_after_exception_failed")
+
+                error_text = str(exc)
                 if "ConsumerTooSlow" in error_text:
                     logger.warning(
                         "firehose_consumer_too_slow_reconnecting",
                         extra={"reconnect_delay_seconds": reconnect_delay_seconds},
                     )
-                    time.sleep(reconnect_delay_seconds)
-                    continue
 
-                logger.exception("firehose_worker_crashed_reconnecting")
                 time.sleep(reconnect_delay_seconds)
                 continue
 
@@ -97,18 +129,18 @@ class FirehoseWorker:
         self._handle_commit(parsed)
 
     def _handle_commit(self, commit: models.ComAtprotoSyncSubscribeRepos.Commit) -> None:
-        post_create_count = 0
-        image_post_count = 0
-        evaluation_errors = 0
-        evaluated_results = []
+        commit_results: list[EvaluationResult] = []
+        commit_post_create_count = 0
+        commit_image_post_count = 0
+        commit_eval_error_count = 0
 
         for post in iter_post_creates(commit):
-            post_create_count += 1
+            commit_post_create_count += 1
 
             if not post.image_alts:
                 continue
 
-            image_post_count += 1
+            commit_image_post_count += 1
 
             try:
                 result = evaluate_post(
@@ -118,10 +150,10 @@ class FirehoseWorker:
                     last_seen_seq=commit.seq,
                 )
                 if result is not None:
-                    evaluated_results.append(result)
+                    commit_results.append(result)
 
             except Exception:
-                evaluation_errors += 1
+                commit_eval_error_count += 1
                 logger.exception(
                     "post_evaluation_failed",
                     extra={
@@ -131,70 +163,108 @@ class FirehoseWorker:
                     },
                 )
 
-        try:
-            with SessionLocal() as session:
-                suppressed_uris = get_suppressed_uris(
-                    session,
-                    [result.uri for result in evaluated_results],
-                )
+        self._pending_commit_count += 1
+        self._pending_post_create_count += commit_post_create_count
+        self._pending_image_post_count += commit_image_post_count
+        self._pending_eval_error_count += commit_eval_error_count
+        self._pending_results.extend(commit_results)
 
-                stored_results = [
-                    result
-                    for result in evaluated_results
-                    if result.uri not in suppressed_uris
-                ]
+        if self._pending_first_seq is None:
+            self._pending_first_seq = commit.seq
 
-                if stored_results:
-                    upsert_post_evaluations(session, stored_results)
+        if self._pending_max_seq is None or commit.seq > self._pending_max_seq:
+            self._pending_max_seq = commit.seq
 
-                image_eval_count = len(stored_results)
-                missing_label_count = sum(
-                    1
-                    for result in stored_results
-                    if result.derived_label == self.settings.label_missing_alt
-                )
-                partial_label_count = sum(
-                    1
-                    for result in stored_results
-                    if result.derived_label == self.settings.label_partial_alt
-                )
+        if self._should_flush():
+            self._flush_pending(reason="threshold_reached")
 
-                bump_firehose_stats(
-                    session,
-                    commit_count=1,
-                    post_create_count=post_create_count,
-                    image_post_count=image_post_count,
-                    image_eval_count=image_eval_count,
-                    missing_label_count=missing_label_count,
-                    partial_label_count=partial_label_count,
-                )
+    def _should_flush(self) -> bool:
+        if self._pending_max_seq is None:
+            return False
 
-                save_cursor(session, commit.seq)
-                session.commit()
+        if self._pending_commit_count >= self.max_pending_commits:
+            return True
 
-        except Exception:
-            logger.exception(
-                "commit_persist_failed",
-                extra={
-                    "repo": commit.repo,
-                    "seq": commit.seq,
-                    "post_create_count": post_create_count,
-                    "image_post_count": image_post_count,
-                    "evaluated_count": len(evaluated_results),
-                },
-            )
+        if len(self._pending_results) >= self.max_pending_results:
+            return True
+
+        if (time.monotonic() - self._last_flush_monotonic) >= self.flush_interval_seconds:
+            return True
+
+        return False
+
+    def _flush_pending(self, *, reason: str) -> None:
+        if self._pending_max_seq is None:
             return
 
-        logger.debug(
-            "commit_processed",
+        pending_results = self._pending_results
+        pending_commit_count = self._pending_commit_count
+        pending_post_create_count = self._pending_post_create_count
+        pending_image_post_count = self._pending_image_post_count
+        pending_max_seq = self._pending_max_seq
+        pending_first_seq = self._pending_first_seq
+        pending_eval_error_count = self._pending_eval_error_count
+
+        unique_uris = list({result.uri for result in pending_results})
+
+        flush_started = time.monotonic()
+
+        with SessionLocal() as session:
+            suppressed_uris = get_suppressed_uris(session, unique_uris)
+
+            stored_results = [
+                result
+                for result in pending_results
+                if result.uri not in suppressed_uris
+            ]
+
+            if stored_results:
+                upsert_post_evaluations(session, stored_results)
+
+            missing_label_count = sum(
+                1
+                for result in stored_results
+                if result.derived_label == self.settings.label_missing_alt
+            )
+            partial_label_count = sum(
+                1
+                for result in stored_results
+                if result.derived_label == self.settings.label_partial_alt
+            )
+
+            bump_firehose_stats(
+                session,
+                commit_count=pending_commit_count,
+                post_create_count=pending_post_create_count,
+                image_post_count=pending_image_post_count,
+                image_eval_count=len(stored_results),
+                missing_label_count=missing_label_count,
+                partial_label_count=partial_label_count,
+            )
+
+            save_cursor(session, pending_max_seq)
+            session.commit()
+
+        flush_seconds = round(time.monotonic() - flush_started, 4)
+
+        logger.info(
+            "firehose_flush_committed",
             extra={
-                "repo": commit.repo,
-                "seq": commit.seq,
-                "post_create_count": post_create_count,
-                "image_post_count": image_post_count,
-                "evaluated_count": len(evaluated_results),
-                "stored_count": len(stored_results),
+                "reason": reason,
+                "first_seq": pending_first_seq,
+                "max_seq": pending_max_seq,
+                "commit_count": pending_commit_count,
+                "post_create_count": pending_post_create_count,
+                "image_post_count": pending_image_post_count,
+                "evaluated_result_count": len(pending_results),
+                "stored_result_count": len(stored_results),
                 "suppressed_count": len(suppressed_uris),
-                "evaluation_errors": evaluation_errors,
+                "missing_label_count": missing_label_count,
+                "partial_label_count": partial_label_count,
+                "evaluation_error_count": pending_eval_error_count,
+                "flush_seconds": flush_seconds,
             },
         )
+
+        self._reset_pending()
+        self._last_flush_monotonic = time.monotonic()
