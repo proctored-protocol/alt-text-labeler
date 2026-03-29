@@ -7,6 +7,7 @@ import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +43,22 @@ def iso(dt: datetime | None) -> str | None:
     return dt.isoformat()
 
 
-def ratio(numerator: int, denominator: int) -> float | None:
-    if denominator <= 0:
+def to_number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return float(value)
+
+
+def ratio(numerator: Any, denominator: Any) -> float | None:
+    num = to_number(numerator)
+    den = to_number(denominator)
+    if den <= 0:
         return None
-    return round((numerator / denominator) * 100.0, 2)
+    return round((num / den) * 100.0, 2)
 
 
 @dataclass
