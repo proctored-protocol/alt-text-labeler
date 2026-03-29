@@ -11,9 +11,9 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.parsing.posts import iter_post_creates
 from app.services.cursor import get_saved_cursor, save_cursor
-from app.services.evaluator import evaluate_post, upsert_post_evaluation
+from app.services.evaluator import evaluate_post, upsert_post_evaluations
 from app.services.firehose_stats import bump_firehose_stats
-from app.services.overrides import is_uri_suppressed
+from app.services.overrides import get_suppressed_uris
 
 logger = logging.getLogger(__name__)
 
@@ -97,99 +97,104 @@ class FirehoseWorker:
         self._handle_commit(parsed)
 
     def _handle_commit(self, commit: models.ComAtprotoSyncSubscribeRepos.Commit) -> None:
-        processed_posts = 0
+        post_create_count = 0
+        image_post_count = 0
+        evaluation_errors = 0
+        evaluated_results = []
 
-        with SessionLocal() as session:
-            bump_firehose_stats(session, commit_count=1)
+        for post in iter_post_creates(commit):
+            post_create_count += 1
 
-            for post in iter_post_creates(commit):
-                try:
-                    bump_firehose_stats(session, post_create_count=1)
+            if not post.image_alts:
+                continue
 
-                    if not post.image_alts:
-                        continue
-
-                    bump_firehose_stats(session, image_post_count=1)
-
-                    if is_uri_suppressed(session, post.uri):
-                        logger.info("post_suppressed", extra={"uri": post.uri})
-                        session.commit()
-                        continue
-
-                    result = evaluate_post(
-                        post=post,
-                        missing_label=self.settings.label_missing_alt,
-                        partial_label=self.settings.label_partial_alt,
-                        last_seen_seq=commit.seq,
-                    )
-
-                    if result is None:
-                        session.commit()
-                        continue
-
-                    upsert_post_evaluation(session, result)
-                    processed_posts += 1
-
-                    bump_firehose_stats(session, image_eval_count=1)
-
-                    if result.derived_label == self.settings.label_missing_alt:
-                        bump_firehose_stats(session, missing_label_count=1)
-                    elif result.derived_label == self.settings.label_partial_alt:
-                        bump_firehose_stats(session, partial_label_count=1)
-
-                    logger.info(
-                        "post_evaluated",
-                        extra={
-                            "uri": result.uri,
-                            "cid": result.cid,
-                            "image_count": result.image_count,
-                            "usable_alt_count": result.usable_alt_count,
-                            "derived_label": result.derived_label,
-                            "mode": "evaluation_only",
-                        },
-                    )
-
-                    if result.derived_label:
-                        logger.info(
-                            "label_candidate_recorded",
-                            extra={
-                                "uri": result.uri,
-                                "cid": result.cid,
-                                "label_value": result.derived_label,
-                                "mode": "evaluation_only",
-                            },
-                        )
-
-                    session.commit()
-
-                except Exception:
-                    session.rollback()
-                    logger.exception(
-                        "post_processing_failed",
-                        extra={
-                            "repo": commit.repo,
-                            "seq": commit.seq,
-                            "uri": getattr(post, "uri", None),
-                        },
-                    )
+            image_post_count += 1
 
             try:
+                result = evaluate_post(
+                    post=post,
+                    missing_label=self.settings.label_missing_alt,
+                    partial_label=self.settings.label_partial_alt,
+                    last_seen_seq=commit.seq,
+                )
+                if result is not None:
+                    evaluated_results.append(result)
+
+            except Exception:
+                evaluation_errors += 1
+                logger.exception(
+                    "post_evaluation_failed",
+                    extra={
+                        "repo": commit.repo,
+                        "seq": commit.seq,
+                        "uri": getattr(post, "uri", None),
+                    },
+                )
+
+        try:
+            with SessionLocal() as session:
+                suppressed_uris = get_suppressed_uris(
+                    session,
+                    [result.uri for result in evaluated_results],
+                )
+
+                stored_results = [
+                    result
+                    for result in evaluated_results
+                    if result.uri not in suppressed_uris
+                ]
+
+                if stored_results:
+                    upsert_post_evaluations(session, stored_results)
+
+                image_eval_count = len(stored_results)
+                missing_label_count = sum(
+                    1
+                    for result in stored_results
+                    if result.derived_label == self.settings.label_missing_alt
+                )
+                partial_label_count = sum(
+                    1
+                    for result in stored_results
+                    if result.derived_label == self.settings.label_partial_alt
+                )
+
+                bump_firehose_stats(
+                    session,
+                    commit_count=1,
+                    post_create_count=post_create_count,
+                    image_post_count=image_post_count,
+                    image_eval_count=image_eval_count,
+                    missing_label_count=missing_label_count,
+                    partial_label_count=partial_label_count,
+                )
+
                 save_cursor(session, commit.seq)
                 session.commit()
-            except Exception:
-                session.rollback()
-                logger.exception(
-                    "cursor_save_failed",
-                    extra={"repo": commit.repo, "seq": commit.seq},
-                )
-                return
 
-        if processed_posts:
-            logger.info(
-                "commit_processed",
+        except Exception:
+            logger.exception(
+                "commit_persist_failed",
                 extra={
                     "repo": commit.repo,
                     "seq": commit.seq,
-                    "processed_posts": processed_posts,
+                    "post_create_count": post_create_count,
+                    "image_post_count": image_post_count,
+                    "evaluated_count": len(evaluated_results),
                 },
             )
+            return
+
+        logger.debug(
+            "commit_processed",
+            extra={
+                "repo": commit.repo,
+                "seq": commit.seq,
+                "post_create_count": post_create_count,
+                "image_post_count": image_post_count,
+                "evaluated_count": len(evaluated_results),
+                "stored_count": len(stored_results),
+                "suppressed_count": len(suppressed_uris),
+                "evaluation_errors": evaluation_errors,
+            },
+        )

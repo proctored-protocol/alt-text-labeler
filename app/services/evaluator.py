@@ -1,8 +1,51 @@
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models import PostEvaluation
 from app.rules.labeling import derive_post_label
 from app.schemas import EvaluationResult, ParsedPostCreate
+
+
+UPSERT_POST_EVALUATION_SQL = text(
+    """
+    INSERT INTO post_evaluation (
+        uri,
+        cid,
+        author_did,
+        repo_did,
+        image_count,
+        usable_alt_count,
+        derived_label,
+        record_created_at,
+        raw_embed_type,
+        evaluated_at,
+        last_seen_seq
+    ) VALUES (
+        :uri,
+        :cid,
+        :author_did,
+        :repo_did,
+        :image_count,
+        :usable_alt_count,
+        :derived_label,
+        :record_created_at,
+        :raw_embed_type,
+        NOW(),
+        :last_seen_seq
+    )
+    ON CONFLICT (uri) DO UPDATE SET
+        cid = EXCLUDED.cid,
+        author_did = EXCLUDED.author_did,
+        repo_did = EXCLUDED.repo_did,
+        image_count = EXCLUDED.image_count,
+        usable_alt_count = EXCLUDED.usable_alt_count,
+        derived_label = EXCLUDED.derived_label,
+        record_created_at = EXCLUDED.record_created_at,
+        raw_embed_type = EXCLUDED.raw_embed_type,
+        evaluated_at = NOW(),
+        last_seen_seq = EXCLUDED.last_seen_seq
+    """
+)
 
 
 def evaluate_post(
@@ -34,36 +77,30 @@ def evaluate_post(
     )
 
 
-def upsert_post_evaluation(session: Session, result: EvaluationResult) -> PostEvaluation:
-    row = session.get(PostEvaluation, result.uri)
+def _result_to_mapping(result: EvaluationResult) -> dict:
+    return {
+        "uri": result.uri,
+        "cid": result.cid,
+        "author_did": result.author_did,
+        "repo_did": result.repo_did,
+        "image_count": result.image_count,
+        "usable_alt_count": result.usable_alt_count,
+        "derived_label": result.derived_label,
+        "record_created_at": result.record_created_at,
+        "raw_embed_type": result.raw_embed_type,
+        "last_seen_seq": result.last_seen_seq,
+    }
 
-    if row is None:
-        row = PostEvaluation(
-            uri=result.uri,
-            cid=result.cid,
-            author_did=result.author_did,
-            repo_did=result.repo_did,
-            image_count=result.image_count,
-            usable_alt_count=result.usable_alt_count,
-            derived_label=result.derived_label,
-            record_created_at=result.record_created_at,
-            raw_embed_type=result.raw_embed_type,
-            last_seen_seq=result.last_seen_seq,
-        )
-        session.add(row)
-        return row
 
-    row.cid = result.cid
-    row.author_did = result.author_did
-    row.repo_did = result.repo_did
-    row.image_count = result.image_count
-    row.usable_alt_count = result.usable_alt_count
-    row.derived_label = result.derived_label
-    row.record_created_at = result.record_created_at
-    row.raw_embed_type = result.raw_embed_type
-    row.last_seen_seq = result.last_seen_seq
+def upsert_post_evaluation(session: Session, result: EvaluationResult) -> None:
+    session.execute(UPSERT_POST_EVALUATION_SQL, _result_to_mapping(result))
 
-    from sqlalchemy import func
-    row.evaluated_at = func.now()
 
-    return row
+def upsert_post_evaluations(session: Session, results: list[EvaluationResult]) -> None:
+    if not results:
+        return
+
+    session.execute(
+        UPSERT_POST_EVALUATION_SQL,
+        [_result_to_mapping(result) for result in results],
+    )

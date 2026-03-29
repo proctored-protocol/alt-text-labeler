@@ -16,6 +16,9 @@ COLS = [
 def bump_firehose_stats(session: Session, **increments: int) -> None:
     vals = {col: int(increments.get(col, 0)) for col in COLS}
 
+    if not any(vals.values()):
+        return
+
     session.execute(
         text("""
             INSERT INTO firehose_minute_stats (

@@ -7,16 +7,24 @@ from app.models import ManualOverride
 
 
 def is_uri_suppressed(session: Session, uri: str) -> bool:
-    stmt = select(ManualOverride).where(ManualOverride.uri == uri)
-    row = session.execute(stmt).scalar_one_or_none()
+    return uri in get_suppressed_uris(session, [uri])
 
-    if row is None:
-        return False
 
-    if row.override_type != "suppress":
-        return False
+def get_suppressed_uris(session: Session, uris: list[str]) -> set[str]:
+    if not uris:
+        return set()
 
-    if row.expires_at is None:
-        return True
+    now = datetime.now(timezone.utc)
 
-    return row.expires_at > datetime.now(timezone.utc)
+    stmt = (
+        select(ManualOverride.uri)
+        .where(ManualOverride.uri.in_(uris))
+        .where(ManualOverride.override_type == "suppress")
+        .where(
+            (ManualOverride.expires_at.is_(None))
+            | (ManualOverride.expires_at > now)
+        )
+    )
+
+    rows = session.execute(stmt).all()
+    return {row[0] for row in rows}
