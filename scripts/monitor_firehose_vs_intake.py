@@ -7,7 +7,6 @@ import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -43,22 +42,10 @@ def iso(dt: datetime | None) -> str | None:
     return dt.isoformat()
 
 
-def to_number(value: Any) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    return float(value)
-
-
-def ratio(numerator: Any, denominator: Any) -> float | None:
-    num = to_number(numerator)
-    den = to_number(denominator)
-    if den <= 0:
+def seconds_between(newer: datetime | None, older: datetime | None) -> float | None:
+    if newer is None or older is None:
         return None
-    return round((num / den) * 100.0, 2)
+    return round((newer - older).total_seconds(), 3)
 
 
 @dataclass
@@ -170,64 +157,6 @@ def get_live_window_counts(conn: sqlite3.Connection, start_minute: datetime, end
     }
 
 
-def get_intake_minute_counts(bucket_start: datetime) -> dict[str, int]:
-    with engine.connect() as conn:
-        row = conn.execute(
-            text(
-                """
-                SELECT
-                    commit_count,
-                    post_create_count,
-                    image_post_count,
-                    image_eval_count,
-                    missing_label_count,
-                    partial_label_count
-                FROM firehose_minute_stats
-                WHERE bucket = :bucket
-                """
-            ),
-            {"bucket": bucket_start},
-        ).mappings().first()
-
-    if row is None:
-        return {
-            "commit_count": 0,
-            "post_create_count": 0,
-            "image_post_count": 0,
-            "image_eval_count": 0,
-            "missing_label_count": 0,
-            "partial_label_count": 0,
-        }
-
-    return dict(row)
-
-
-def get_intake_window_counts(start_minute: datetime, end_minute_exclusive: datetime) -> dict[str, int]:
-    with engine.connect() as conn:
-        row = conn.execute(
-            text(
-                """
-                SELECT
-                    COALESCE(SUM(commit_count), 0) AS commit_count,
-                    COALESCE(SUM(post_create_count), 0) AS post_create_count,
-                    COALESCE(SUM(image_post_count), 0) AS image_post_count,
-                    COALESCE(SUM(image_eval_count), 0) AS image_eval_count,
-                    COALESCE(SUM(missing_label_count), 0) AS missing_label_count,
-                    COALESCE(SUM(partial_label_count), 0) AS partial_label_count
-                FROM firehose_minute_stats
-                WHERE bucket >= :start_bucket
-                  AND bucket < :end_bucket
-                """
-            ),
-            {
-                "start_bucket": start_minute,
-                "end_bucket": end_minute_exclusive,
-            },
-        ).mappings().one()
-
-    return dict(row)
-
-
 def get_intake_cursor() -> dict[str, Any]:
     with engine.connect() as conn:
         row = conn.execute(
@@ -239,6 +168,55 @@ def get_intake_cursor() -> dict[str, Any]:
                     updated_at
                 FROM firehose_cursor
                 WHERE stream_name = 'subscribe_repos'
+                """
+            )
+        ).mappings().first()
+
+    return dict(row) if row is not None else {}
+
+
+def get_post_evaluation_state() -> dict[str, Any]:
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE evaluated_at >= NOW() - INTERVAL '2 minutes'
+                    ) AS evaluated_rows_2m,
+                    COUNT(*) FILTER (
+                        WHERE evaluated_at >= NOW() - INTERVAL '10 minutes'
+                    ) AS evaluated_rows_10m,
+                    COUNT(*) FILTER (
+                        WHERE evaluated_at >= NOW() - INTERVAL '10 minutes'
+                          AND derived_label IN ('missing-alt-text', 'partial-alt-text')
+                    ) AS labeled_rows_10m,
+                    MAX(last_seen_seq) AS max_last_seen_seq,
+                    MAX(evaluated_at) AS max_evaluated_at
+                FROM post_evaluation
+                """
+            )
+        ).mappings().one()
+
+    return dict(row)
+
+
+def get_latest_intake_stats_bucket() -> dict[str, Any]:
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT
+                    bucket,
+                    commit_count,
+                    post_create_count,
+                    image_post_count,
+                    image_eval_count,
+                    missing_label_count,
+                    partial_label_count
+                FROM firehose_minute_stats
+                ORDER BY bucket DESC
+                LIMIT 1
                 """
             )
         ).mappings().first()
@@ -273,15 +251,56 @@ def build_update_payload(
     monitor_start_minute: datetime,
     latest_completed_minute: datetime,
     sample_no: int,
+    initial_cursor: CursorSnapshot,
+    initial_post_eval_max_seq: int | None,
 ) -> dict[str, Any]:
     live_minute = get_live_minute_counts(conn, latest_completed_minute)
-    intake_minute = get_intake_minute_counts(latest_completed_minute)
-
-    window_end = latest_completed_minute + timedelta(minutes=1)
-    live_window = get_live_window_counts(conn, monitor_start_minute, window_end)
-    intake_window = get_intake_window_counts(monitor_start_minute, window_end)
+    live_window = get_live_window_counts(
+        conn,
+        monitor_start_minute,
+        latest_completed_minute + timedelta(minutes=1),
+    )
 
     cursor_snapshot = get_cursor_snapshot(conn)
+    post_eval_state = get_post_evaluation_state()
+    intake_stats_latest_bucket = get_latest_intake_stats_bucket()
+
+    current_live_seq = cursor_snapshot.live_monitor_last_seq
+    current_intake_seq = cursor_snapshot.intake_cursor_last_seq
+    current_gap = cursor_snapshot.seq_gap_live_minus_intake
+    current_post_eval_seq = post_eval_state.get("max_last_seen_seq")
+
+    live_seq_delta_since_start = None
+    if initial_cursor.live_monitor_last_seq is not None and current_live_seq is not None:
+        live_seq_delta_since_start = int(current_live_seq) - int(initial_cursor.live_monitor_last_seq)
+
+    intake_cursor_delta_since_start = None
+    if initial_cursor.intake_cursor_last_seq is not None and current_intake_seq is not None:
+        intake_cursor_delta_since_start = int(current_intake_seq) - int(initial_cursor.intake_cursor_last_seq)
+
+    post_eval_seq_delta_since_start = None
+    if initial_post_eval_max_seq is not None and current_post_eval_seq is not None:
+        post_eval_seq_delta_since_start = int(current_post_eval_seq) - int(initial_post_eval_max_seq)
+
+    seq_gap_change_since_start = None
+    if initial_cursor.seq_gap_live_minus_intake is not None and current_gap is not None:
+        seq_gap_change_since_start = int(current_gap) - int(initial_cursor.seq_gap_live_minus_intake)
+
+    seq_gap_live_minus_post_eval = None
+    if current_live_seq is not None and current_post_eval_seq is not None:
+        seq_gap_live_minus_post_eval = int(current_live_seq) - int(current_post_eval_seq)
+
+    seq_gap_post_eval_minus_cursor = None
+    if current_post_eval_seq is not None and current_intake_seq is not None:
+        seq_gap_post_eval_minus_cursor = int(current_post_eval_seq) - int(current_intake_seq)
+
+    cursor_updated_at_dt = None
+    if cursor_snapshot.intake_cursor_updated_at is not None:
+        cursor_updated_at_dt = datetime.fromisoformat(cursor_snapshot.intake_cursor_updated_at)
+
+    max_evaluated_at_dt = None
+    if post_eval_state.get("max_evaluated_at") is not None:
+        max_evaluated_at_dt = post_eval_state["max_evaluated_at"]
 
     return {
         "event": "firehose_vs_intake_update",
@@ -290,28 +309,47 @@ def build_update_payload(
         "monitor_window": {
             "start_minute_utc": iso(monitor_start_minute),
             "latest_completed_minute_utc": iso(latest_completed_minute),
-            "completed_minutes_included": int((window_end - monitor_start_minute).total_seconds() // 60),
+            "completed_minutes_included": int(
+                ((latest_completed_minute + timedelta(minutes=1)) - monitor_start_minute).total_seconds() // 60
+            ),
         },
-        "latest_completed_minute": {
-            "bucket_utc": iso(latest_completed_minute),
-            "live": live_minute,
-            "intake": intake_minute,
-            "ratios_pct": {
-                "post_create": ratio(intake_minute["post_create_count"], live_minute["post_create_count"]),
-                "image_post": ratio(intake_minute["image_post_count"], live_minute["image_post_count"]),
-                "missing_alt": ratio(intake_minute["missing_label_count"], live_minute["missing_alt_post_count"]),
+        "live": {
+            "latest_completed_minute": {
+                "bucket_utc": iso(latest_completed_minute),
+                "counts": live_minute,
             },
+            "cumulative_completed_window": live_window,
         },
-        "cumulative_completed_window": {
-            "live": live_window,
-            "intake": intake_window,
-            "ratios_pct": {
-                "post_create": ratio(intake_window["post_create_count"], live_window["post_create_count"]),
-                "image_post": ratio(intake_window["image_post_count"], live_window["image_post_count"]),
-                "missing_alt": ratio(intake_window["missing_label_count"], live_window["missing_alt_post_count"]),
-            },
+        "intake_cursor": asdict(cursor_snapshot),
+        "post_evaluation": {
+            "evaluated_rows_2m": post_eval_state.get("evaluated_rows_2m"),
+            "evaluated_rows_10m": post_eval_state.get("evaluated_rows_10m"),
+            "labeled_rows_10m": post_eval_state.get("labeled_rows_10m"),
+            "max_last_seen_seq": current_post_eval_seq,
+            "max_evaluated_at": iso(max_evaluated_at_dt) if isinstance(max_evaluated_at_dt, datetime) else None,
+            "seq_gap_live_minus_post_eval": seq_gap_live_minus_post_eval,
+            "seq_gap_post_eval_minus_cursor": seq_gap_post_eval_minus_cursor,
         },
-        "cursor": asdict(cursor_snapshot),
+        "intake_stats_latest_bucket": {
+            "note": "Flush-bucketed only; useful for activity, not live apples-to-apples comparison.",
+            **({
+                "bucket_utc": iso(intake_stats_latest_bucket.get("bucket")) if intake_stats_latest_bucket.get("bucket") else None,
+                "commit_count": intake_stats_latest_bucket.get("commit_count"),
+                "post_create_count": intake_stats_latest_bucket.get("post_create_count"),
+                "image_post_count": intake_stats_latest_bucket.get("image_post_count"),
+                "image_eval_count": intake_stats_latest_bucket.get("image_eval_count"),
+                "missing_label_count": intake_stats_latest_bucket.get("missing_label_count"),
+                "partial_label_count": intake_stats_latest_bucket.get("partial_label_count"),
+            } if intake_stats_latest_bucket else {}),
+        },
+        "diagnostics": {
+            "live_seq_delta_since_start": live_seq_delta_since_start,
+            "intake_cursor_delta_since_start": intake_cursor_delta_since_start,
+            "post_eval_seq_delta_since_start": post_eval_seq_delta_since_start,
+            "seq_gap_change_since_start": seq_gap_change_since_start,
+            "cursor_updated_age_seconds": seconds_between(utc_now(), cursor_updated_at_dt),
+            "post_eval_updated_age_seconds": seconds_between(utc_now(), max_evaluated_at_dt) if isinstance(max_evaluated_at_dt, datetime) else None,
+        },
     }
 
 
@@ -324,7 +362,7 @@ def sleep_until_next_boundary(update_seconds: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare live firehose monitor counts against intake-worker counts over a fixed interval."
+        description="Compare live firehose head movement against intake cursor and post_evaluation movement."
     )
     parser.add_argument(
         "--live-db-path",
@@ -355,6 +393,10 @@ def main() -> None:
     started_at = utc_now()
     monitor_start_minute = floor_minute(started_at)
 
+    initial_cursor = get_cursor_snapshot(conn)
+    initial_post_eval_state = get_post_evaluation_state()
+    initial_post_eval_max_seq = initial_post_eval_state.get("max_last_seen_seq")
+
     print(
         json.dumps(
             {
@@ -364,9 +406,18 @@ def main() -> None:
                 "duration_minutes": args.duration_minutes,
                 "update_seconds": args.update_seconds,
                 "monitor_start_minute_utc": iso(monitor_start_minute),
-                "note": "Uses completed UTC minute buckets only. In-progress current minute is excluded.",
+                "note": "Focus on live head, intake cursor, and post_evaluation movement. firehose_minute_stats is flush-bucketed only.",
+                "initial_cursor": asdict(initial_cursor),
+                "initial_post_evaluation": {
+                    "max_last_seen_seq": initial_post_eval_state.get("max_last_seen_seq"),
+                    "max_evaluated_at": iso(initial_post_eval_state.get("max_evaluated_at")) if initial_post_eval_state.get("max_evaluated_at") else None,
+                    "evaluated_rows_2m": initial_post_eval_state.get("evaluated_rows_2m"),
+                    "evaluated_rows_10m": initial_post_eval_state.get("evaluated_rows_10m"),
+                    "labeled_rows_10m": initial_post_eval_state.get("labeled_rows_10m"),
+                },
             },
             ensure_ascii=False,
+            default=str,
         ),
         flush=True,
     )
@@ -386,9 +437,11 @@ def main() -> None:
             monitor_start_minute=monitor_start_minute,
             latest_completed_minute=latest_completed_minute,
             sample_no=sample_no,
+            initial_cursor=initial_cursor,
+            initial_post_eval_max_seq=initial_post_eval_max_seq,
         )
 
-        gap = payload["cursor"]["seq_gap_live_minus_intake"]
+        gap = payload["intake_cursor"]["seq_gap_live_minus_intake"]
         if gap is not None:
             gaps.append(int(gap))
 
@@ -400,6 +453,8 @@ def main() -> None:
         monitor_start_minute=monitor_start_minute,
         latest_completed_minute=final_latest_completed_minute,
         sample_no=sample_no,
+        initial_cursor=initial_cursor,
+        initial_post_eval_max_seq=initial_post_eval_max_seq,
     )
 
     final_payload["event"] = "firehose_vs_intake_monitor_finished"
