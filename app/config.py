@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from functools import lru_cache
 
 from pydantic import Field, field_validator
@@ -12,54 +14,139 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # --- general -------------------------------------------------------------
+
     app_env: str = Field(default="local")
     log_level: str = Field(default="INFO")
 
-    firehose_base_uri: str = Field(default="wss://bsky.network/xrpc")
-    firehose_cursor: int | None = Field(default=None)
-    firehose_dry_run: bool = Field(default=True)
+    # --- database ------------------------------------------------------------
 
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/alt_labeler"
     )
 
+    # --- firehose / consumers ------------------------------------------------
+
+    firehose_base_uri: str = Field(default="wss://bsky.network/xrpc")
+    firehose_stream_name: str = Field(default="subscribe_repos")
+
+    head_tracker_resume_from_consumer_state: bool = Field(default=True)
+    head_tracker_start_cursor: int | None = Field(default=None)
+
+    intake_resume_from_consumer_state: bool = Field(default=True)
+    intake_start_cursor: int | None = Field(default=None)
+
+    # --- rules / labels ------------------------------------------------------
+
+    rule_version: str = Field(default="v2")
     label_missing_alt: str = Field(default="missing-alt-text")
     label_partial_alt: str = Field(default="partial-alt-text")
 
-    bsky_handle: str | None = Field(default=None)
-    bsky_app_password: str | None = Field(default=None)
-    bsky_pds_url: str = Field(default="https://bsky.social")
+    # --- apply worker --------------------------------------------------------
 
-    test_viewer_handle: str | None = Field(default=None)
-    test_viewer_app_password: str | None = Field(default=None)
+    apply_batch_size: int = Field(default=200)
+    apply_lease_seconds: int = Field(default=60)
+    apply_idle_sleep_seconds: float = Field(default=1.0)
+    apply_max_attempts: int = Field(default=5)
+
+    # --- publish worker ------------------------------------------------------
+
+    publish_enabled: bool = Field(default=False)
+    publish_backend: str = Field(default="ozone")
+
+    publish_batch_size: int = Field(default=50)
+    publish_lease_seconds: int = Field(default=90)
+    publish_idle_sleep_seconds: float = Field(default=1.0)
+    publish_max_attempts: int = Field(default=10)
+    publish_backoff_base_seconds: int = Field(default=15)
+
+    # --- visibility worker ---------------------------------------------------
+
+    visibility_batch_size: int = Field(default=50)
+    visibility_lease_seconds: int = Field(default=180)
+    visibility_idle_sleep_seconds: float = Field(default=1.0)
+    visibility_max_attempts: int = Field(default=20)
+    visibility_retry_seconds: int = Field(default=30)
+    visibility_max_age_seconds: int = Field(default=1800)
+    visibility_request_timeout_seconds: int = Field(default=30)
+
+    # --- control plane / watchdog -------------------------------------------
+
+    watchdog_poll_seconds: int = Field(default=30)
+    heartbeat_stale_seconds: int = Field(default=120)
+    intake_stall_seconds: int = Field(default=180)
+    target_lag_seconds_min: int = Field(default=30)
+    target_lag_seconds_max: int = Field(default=60)
+
+    # --- bluesky / ozone / verification -------------------------------------
+
+    bsky_pds_url: str = Field(default="https://bsky.social")
 
     ozone_base_url: str | None = Field(default=None)
     ozone_proxy_did: str | None = Field(default=None)
     ozone_handle: str | None = Field(default=None)
     ozone_app_password: str | None = Field(default=None)
-    publish_via_ozone: bool = Field(default=False)
 
-    publish_mode: str = Field(default="sync")
-    publisher_max_attempts: int = Field(default=10)
-    publisher_lease_seconds: int = Field(default=60)
-    publisher_batch_size: int = Field(default=25)
-    publisher_backoff_base_seconds: int = Field(default=15)
-    publisher_idle_sleep_seconds: float = Field(default=1.0)
+    verifier_labeler_did: str | None = Field(default=None)
+    verifier_appview_url: str = Field(default="https://bsky.social")
+    test_viewer_handle: str | None = Field(default=None)
+    test_viewer_app_password: str | None = Field(default=None)
+
+    # --- dashboard -----------------------------------------------------------
+
+    dashboard_host: str = Field(default="0.0.0.0")
+    dashboard_port: int = Field(default=8765)
+    dashboard_username: str | None = Field(default=None)
+    dashboard_password: str | None = Field(default=None)
+
+    @field_validator("app_env")
+    @classmethod
+    def normalize_app_env(cls, value: str) -> str:
+        return value.strip().lower()
 
     @field_validator("log_level")
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
-        return value.upper().strip()
+        return value.strip().upper()
 
-    @field_validator("publish_mode")
+    @field_validator("firehose_stream_name")
     @classmethod
-    def normalize_publish_mode(cls, value: str) -> str:
-        return value.lower().strip()
+    def normalize_firehose_stream_name(cls, value: str) -> str:
+        return value.strip()
 
-    @field_validator("firehose_cursor", mode="before")
+    @field_validator("publish_backend")
+    @classmethod
+    def normalize_publish_backend(cls, value: str) -> str:
+        return value.strip().lower()
+
+    @field_validator(
+        "head_tracker_start_cursor",
+        "intake_start_cursor",
+        mode="before",
+    )
     @classmethod
     def blank_cursor_to_none(cls, value):
         if value in ("", None):
+            return None
+        return value
+
+    @field_validator(
+        "ozone_base_url",
+        "ozone_proxy_did",
+        "ozone_handle",
+        "ozone_app_password",
+        "verifier_labeler_did",
+        "test_viewer_handle",
+        "test_viewer_app_password",
+        "dashboard_username",
+        "dashboard_password",
+        mode="before",
+    )
+    @classmethod
+    def blank_string_to_none(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() == "":
             return None
         return value
 
