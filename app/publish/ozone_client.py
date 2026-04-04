@@ -37,12 +37,14 @@ class OzoneClient:
         base_url: str,
         identifier: str,
         password: str,
+        proxy_did: str,
         timeout_seconds: float = 30.0,
         user_agent: str = "alt-text-labeler-publisher/2",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.identifier = identifier
         self.password = password
+        self.proxy_did = proxy_did
         self.timeout_seconds = timeout_seconds
         self.user_agent = user_agent
 
@@ -55,6 +57,10 @@ class OzoneClient:
             self._login()
         assert self._did is not None
         return self._did
+
+    @property
+    def created_by_did(self) -> str:
+        return self.proxy_did.split("#", 1)[0]
 
     def _build_headers(self, *, authorized: bool) -> dict[str, str]:
         headers = {
@@ -194,7 +200,7 @@ class OzoneClient:
                 "uri": uri,
                 "cid": cid,
             },
-            "createdBy": self.did,
+            "createdBy": self.created_by_did,
         }
 
         resp = self._http_json(

@@ -107,22 +107,30 @@ def insert_publish_attempt(
     *,
     publish_job_id: int,
     attempt_no: int,
-    attempted_at: datetime,
-    success: bool,
+    worker_name: str,
+    started_at: datetime,
+    finished_at: datetime,
+    result_status: str,
     http_status: int | None,
     error_code: str | None,
     error_text: str | None,
+    external_event_id: str | None,
+    external_created_at: datetime | None,
     response_json: dict | None,
 ) -> None:
     session.add(
         PublishAttempt(
             publish_job_id=publish_job_id,
             attempt_no=attempt_no,
-            attempted_at=attempted_at,
-            success=success,
+            worker_name=worker_name,
+            started_at=started_at,
+            finished_at=finished_at,
+            result_status=result_status,
             http_status=http_status,
             error_code=error_code,
             error_text=error_text,
+            external_event_id=external_event_id,
+            external_created_at=external_created_at,
             response_json=response_json,
         )
     )
@@ -148,6 +156,7 @@ def mark_job_retry_or_error(
     error_text: str,
     max_attempts: int,
     backoff_base_seconds: int,
+    retryable: bool,
     now: datetime | None = None,
 ) -> None:
     now = now or utc_now()
@@ -157,7 +166,7 @@ def mark_job_retry_or_error(
     row.lease_owner = None
     row.lease_until = None
 
-    if row.attempt_count >= max_attempts:
+    if (not retryable) or row.attempt_count >= max_attempts:
         row.status = "error"
         return
 

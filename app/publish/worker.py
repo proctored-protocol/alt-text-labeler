@@ -27,6 +27,15 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def parse_external_created_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 class PublishWorker:
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -38,21 +47,23 @@ class PublishWorker:
         ozone_base_url = getattr(self.settings, "ozone_base_url", None)
         ozone_handle = getattr(self.settings, "ozone_handle", None)
         ozone_app_password = getattr(self.settings, "ozone_app_password", None)
+        ozone_proxy_did = getattr(self.settings, "ozone_proxy_did", None)
 
-        if not ozone_base_url or not ozone_handle or not ozone_app_password:
+        if not ozone_base_url or not ozone_handle or not ozone_app_password or not ozone_proxy_did:
             raise RuntimeError(
-                "PublishWorker requires ozone_base_url, ozone_handle, and ozone_app_password."
+                "PublishWorker requires ozone_base_url, ozone_handle, ozone_app_password, and ozone_proxy_did."
             )
 
         self.client = OzoneClient(
             base_url=str(ozone_base_url),
             identifier=str(ozone_handle),
             password=str(ozone_app_password),
-            timeout_seconds=float(getattr(self.settings, "publish_timeout_seconds", 30.0)),
+            proxy_did=str(ozone_proxy_did),
+            timeout_seconds=30.0,
         )
 
         self.batch_size = int(getattr(self.settings, "publish_batch_size", 50))
-        self.lease_seconds = int(getattr(self.settings, "publish_lease_seconds", 60))
+        self.lease_seconds = int(getattr(self.settings, "publish_lease_seconds", 90))
         self.max_attempts = int(getattr(self.settings, "publish_max_attempts", 10))
         self.idle_sleep_seconds = float(
             getattr(self.settings, "publish_idle_sleep_seconds", 1.0)
@@ -69,6 +80,7 @@ class PublishWorker:
                 "lease_seconds": self.lease_seconds,
                 "max_attempts": self.max_attempts,
                 "ozone_base_url": ozone_base_url,
+                "created_by_did": self.client.created_by_did,
             },
         )
 
@@ -99,6 +111,7 @@ class PublishWorker:
                     "ozone_base_url": getattr(self.settings, "ozone_base_url", None),
                     "batch_size": self.batch_size,
                     "lease_seconds": self.lease_seconds,
+                    "created_by_did": self.client.created_by_did,
                 },
             )
 
@@ -184,6 +197,7 @@ class PublishWorker:
                 comment=None,
                 duration_in_hours=None,
             )
+            finished_at = utc_now()
 
             with session_scope() as session:
                 row = get_leased_publish_job_for_worker(
@@ -198,16 +212,20 @@ class PublishWorker:
                     session,
                     publish_job_id=publish_job_id,
                     attempt_no=attempt_no,
-                    attempted_at=attempt_started_at,
-                    success=True,
+                    worker_name=self.worker_name,
+                    started_at=attempt_started_at,
+                    finished_at=finished_at,
+                    result_status="published",
                     http_status=200,
                     error_code=None,
                     error_text=None,
+                    external_event_id=str(response_json.get("id")) if response_json.get("id") is not None else None,
+                    external_created_at=parse_external_created_at(response_json.get("createdAt")),
                     response_json=response_json,
                 )
                 mark_job_published(
                     row,
-                    published_at=utc_now(),
+                    published_at=finished_at,
                 )
 
             logger.info(
@@ -222,6 +240,8 @@ class PublishWorker:
             )
 
         except OzonePublishError as exc:
+            finished_at = utc_now()
+
             with session_scope() as session:
                 row = get_leased_publish_job_for_worker(
                     session,
@@ -231,15 +251,21 @@ class PublishWorker:
                 if row is None:
                     return
 
+                result_status = "error" if (not exc.retryable or attempt_no >= self.max_attempts) else "retry_pending"
+
                 insert_publish_attempt(
                     session,
                     publish_job_id=publish_job_id,
                     attempt_no=attempt_no,
-                    attempted_at=attempt_started_at,
-                    success=False,
+                    worker_name=self.worker_name,
+                    started_at=attempt_started_at,
+                    finished_at=finished_at,
+                    result_status=result_status,
                     http_status=exc.http_status,
                     error_code=exc.error_code,
                     error_text=exc.error_text,
+                    external_event_id=None,
+                    external_created_at=None,
                     response_json=exc.response_json,
                 )
                 mark_job_retry_or_error(
@@ -248,7 +274,8 @@ class PublishWorker:
                     error_text=exc.error_text,
                     max_attempts=self.max_attempts,
                     backoff_base_seconds=self.backoff_base_seconds,
-                    now=utc_now(),
+                    retryable=exc.retryable,
+                    now=finished_at,
                 )
 
             logger.warning(
