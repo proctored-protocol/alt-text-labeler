@@ -50,7 +50,7 @@ Build a labeler that:
 ## Current status
 
 ### Current phase
-**Phase 4 — Apply**
+**Phase 5 — Publish**
 
 ### Completed
 - Legacy v1 runtime was stopped on the server.
@@ -78,14 +78,21 @@ Build a labeler that:
   - stay live over extended runs,
   - produce believable lag metrics against the live head tracker,
   - recover from lag spikes without evidence of runaway drift.
+- Apply storage and runtime were implemented against the canonical schema.
+- Apply was verified to:
+  - lease and process `intake_item` backlog correctly,
+  - materialize canonical `label_decision` rows,
+  - create `publish_job` rows only for publishable outcomes,
+  - keep up with intake once backlog was drained,
+  - add virtually no extra lag beyond the intake frontier in steady state.
 
 ### Next immediate step
-Implement apply:
-- lease pending `intake_item` rows,
-- evaluate them using the canonical ruleset,
-- materialize results in `label_decision`,
-- create `publish_job` rows only when publication is required,
-- keep apply fully separate from publish and visibility verification.
+Implement publish:
+- reset and verify the labeler service record before first live publish,
+- lease pending `publish_job` rows,
+- emit labels through Ozone with full attempt logging,
+- detect rate limits, auth failures, and service-record mismatches clearly,
+- keep publish fully separate from visibility verification.
 
 ---
 
@@ -367,3 +374,4 @@ These remain open until explicitly resolved.
 - Advanced from Phase 1 — Schema first to Phase 2 — Head tracker after successful canonical schema migration and verification.
 - Advanced from Phase 2 — Head tracker to Phase 3 — Intake after validating continuous per-second head sampling, restart behavior, and correct zero-gap lag reporting for the head tracker.
 - Advanced from Phase 3 — Intake to Phase 4 — Apply after validating long-running intake behavior, durable cursor updates, live `intake_item` writes, and believable lag/recovery behavior against the head tracker.
+- Advanced from Phase 4 — Apply to Phase 5 — Publish after validating apply backlog drain, `label_decision` materialization, correct `publish_job` creation, and near-zero lag between apply completion and the intake frontier.
