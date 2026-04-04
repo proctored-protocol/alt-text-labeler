@@ -50,7 +50,7 @@ Build a labeler that:
 ## Current status
 
 ### Current phase
-**Phase 3 — Intake**
+**Phase 4 — Apply**
 
 ### Completed
 - Legacy v1 runtime was stopped on the server.
@@ -71,13 +71,21 @@ Build a labeler that:
   - restart cleanly,
   - report zero gap to head for itself,
   - maintain low freshness values while running.
+- Intake storage and runtime were implemented against the canonical schema.
+- Intake was verified to:
+  - maintain its own durable cursor,
+  - persist relevant image posts into `intake_item`,
+  - stay live over extended runs,
+  - produce believable lag metrics against the live head tracker,
+  - recover from lag spikes without evidence of runaway drift.
 
 ### Next immediate step
-Implement intake:
-- consume from its own cursor,
-- persist only relevant posts with images into `intake_item`,
-- keep intake separate from rule evaluation,
-- measure lag correctly against the live head tracker.
+Implement apply:
+- lease pending `intake_item` rows,
+- evaluate them using the canonical ruleset,
+- materialize results in `label_decision`,
+- create `publish_job` rows only when publication is required,
+- keep apply fully separate from publish and visibility verification.
 
 ---
 
@@ -358,3 +366,4 @@ These remain open until explicitly resolved.
 - Current phase set to Phase 1 — Schema first.
 - Advanced from Phase 1 — Schema first to Phase 2 — Head tracker after successful canonical schema migration and verification.
 - Advanced from Phase 2 — Head tracker to Phase 3 — Intake after validating continuous per-second head sampling, restart behavior, and correct zero-gap lag reporting for the head tracker.
+- Advanced from Phase 3 — Intake to Phase 4 — Apply after validating long-running intake behavior, durable cursor updates, live `intake_item` writes, and believable lag/recovery behavior against the head tracker.
