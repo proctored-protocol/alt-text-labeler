@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from collections.abc import Iterator, Mapping
+from datetime import datetime
 from typing import Any
 
 from atproto import CAR, models
@@ -28,6 +31,20 @@ def _get_record_type(record: Any) -> str | None:
     return record_dict.get("$type") or record_dict.get("py_type")
 
 
+def _parse_record_created_at(value: Any) -> datetime | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 def iter_post_creates(
     commit: models.ComAtprotoSyncSubscribeRepos.Commit,
 ) -> Iterator[ParsedPostCreate]:
@@ -46,7 +63,6 @@ def iter_post_creates(
         if _get_record_type(record_dict) != POST_RECORD_TYPE:
             continue
 
-        image_alts = extract_image_alts_from_record(record_dict)
         embed = record_dict.get("embed") or {}
         raw_embed_type = None
         if isinstance(embed, Mapping):
@@ -58,8 +74,9 @@ def iter_post_creates(
             repo_did=commit.repo,
             author_did=commit.repo,
             path=op.path,
-            created_at=record_dict.get("createdAt") or record_dict.get("created_at"),
-            image_alts=image_alts,
-            raw_record=record_dict,
+            record_created_at=_parse_record_created_at(
+                record_dict.get("createdAt") or record_dict.get("created_at")
+            ),
+            image_alts=extract_image_alts_from_record(record_dict),
             raw_embed_type=raw_embed_type,
         )

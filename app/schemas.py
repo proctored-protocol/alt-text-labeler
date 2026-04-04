@@ -1,29 +1,20 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ParsedPostCreate:
     uri: str
     cid: str
     repo_did: str
     author_did: str
     path: str
-    created_at: str | None
+    record_created_at: datetime | None
     image_alts: list[str | None]
-    raw_record: dict[str, Any]
     raw_embed_type: str | None
 
-
-@dataclass(slots=True)
-class EvaluationResult:
-    uri: str
-    cid: str
-    author_did: str
-    repo_did: str
-    image_count: int
-    usable_alt_count: int
-    derived_label: str | None
-    record_created_at: str | None
-    raw_embed_type: str | None
-    last_seen_seq: int | None
+    @property
+    def image_count(self) -> int:
+        return len(self.image_alts)

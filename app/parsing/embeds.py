@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -45,5 +47,4 @@ def extract_image_alts_from_embed(embed: Any) -> list[str | None]:
 
 
 def extract_image_alts_from_record(record: Mapping[str, Any]) -> list[str | None]:
-    embed = record.get("embed")
-    return extract_image_alts_from_embed(embed)
+    return extract_image_alts_from_embed(record.get("embed"))
