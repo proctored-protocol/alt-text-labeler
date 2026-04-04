@@ -50,7 +50,7 @@ Build a labeler that:
 ## Current status
 
 ### Current phase
-**Phase 2 — Head tracker**
+**Phase 3 — Intake**
 
 ### Completed
 - Legacy v1 runtime was stopped on the server.
@@ -63,13 +63,21 @@ Build a labeler that:
 - Alembic migration path was set up.
 - Initial canonical v2 schema migration was applied successfully.
 - Canonical tables were verified in Postgres.
+- Head tracker storage layer (`consumer_state`, `firehose_head_sample`) was implemented.
+- Head tracker runtime was implemented and tested.
+- Head tracker was verified to:
+  - write continuous per-second samples,
+  - maintain correct consumer state,
+  - restart cleanly,
+  - report zero gap to head for itself,
+  - maintain low freshness values while running.
 
 ### Next immediate step
-Implement the head tracker:
-- consume the firehose at the front,
-- store authoritative per-second head samples,
-- write durable consumer state for the head tracker,
-- expose correct head freshness and lag foundations for intake.
+Implement intake:
+- consume from its own cursor,
+- persist only relevant posts with images into `intake_item`,
+- keep intake separate from rule evaluation,
+- measure lag correctly against the live head tracker.
 
 ---
 
@@ -349,3 +357,4 @@ These remain open until explicitly resolved.
 - Agreed to use this file as the external source of truth.
 - Current phase set to Phase 1 — Schema first.
 - Advanced from Phase 1 — Schema first to Phase 2 — Head tracker after successful canonical schema migration and verification.
+- Advanced from Phase 2 — Head tracker to Phase 3 — Intake after validating continuous per-second head sampling, restart behavior, and correct zero-gap lag reporting for the head tracker.
