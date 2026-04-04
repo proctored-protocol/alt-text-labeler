@@ -50,7 +50,7 @@ Build a labeler that:
 ## Current status
 
 ### Current phase
-**Phase 1 — Schema first**
+**Phase 2 — Head tracker**
 
 ### Completed
 - Legacy v1 runtime was stopped on the server.
@@ -59,14 +59,17 @@ Build a labeler that:
 - Active branch switched to `rebuild-v2`.
 - Legacy script sprawl removed from the active runtime path.
 - Rebuild architecture agreed at a high level.
+- Canonical `config.py`, `db.py`, and `models.py` were created.
+- Alembic migration path was set up.
+- Initial canonical v2 schema migration was applied successfully.
+- Canonical tables were verified in Postgres.
 
 ### Next immediate step
-Define the canonical v2 schema:
-- tables,
-- fields,
-- keys,
-- indexes,
-- stage state transitions.
+Implement the head tracker:
+- consume the firehose at the front,
+- store authoritative per-second head samples,
+- write durable consumer state for the head tracker,
+- expose correct head freshness and lag foundations for intake.
 
 ---
 
@@ -345,3 +348,4 @@ These remain open until explicitly resolved.
 - Created v2 rebuild plan.
 - Agreed to use this file as the external source of truth.
 - Current phase set to Phase 1 — Schema first.
+- Advanced from Phase 1 — Schema first to Phase 2 — Head tracker after successful canonical schema migration and verification.
