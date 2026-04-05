@@ -56,6 +56,7 @@ class PublishWorker:
 
         self.client = OzoneClient(
             base_url=str(ozone_base_url),
+            pds_url=str(self.settings.bsky_pds_url),
             identifier=str(ozone_handle),
             password=str(ozone_app_password),
             proxy_did=str(ozone_proxy_did),
