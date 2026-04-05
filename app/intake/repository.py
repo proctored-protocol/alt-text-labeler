@@ -1,17 +1,32 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.models import ConsumerState, IntakeItem
-from app.schemas import ParsedPostCreate
 
 
 INTAKE_CONSUMER_NAME = "intake"
 INTAKE_CONSUMER_TYPE = "intake"
+
+
+@dataclass(frozen=True, slots=True)
+class BufferedIntakePost:
+    uri: str
+    cid: str
+    author_did: str
+    repo_did: str
+    record_created_at: datetime | None
+    firehose_seq: int
+    firehose_observed_at: datetime
+    raw_embed_type: str | None
+    image_count: int
+    image_alts_json: Any
 
 
 def get_consumer_state(session: Session, consumer_name: str) -> ConsumerState | None:
@@ -72,30 +87,28 @@ def upsert_consumer_state(
 def upsert_intake_items(
     session: Session,
     *,
-    posts: list[ParsedPostCreate],
-    firehose_seq: int,
-    firehose_observed_at: datetime,
-) -> None:
-    if not posts:
-        return
+    rows: list[BufferedIntakePost],
+) -> int:
+    if not rows:
+        return 0
 
-    rows = [
+    insert_rows = [
         {
-            "uri": post.uri,
-            "cid": post.cid,
-            "author_did": post.author_did,
-            "repo_did": post.repo_did,
-            "record_created_at": post.record_created_at,
-            "firehose_seq": firehose_seq,
-            "firehose_observed_at": firehose_observed_at,
-            "raw_embed_type": post.raw_embed_type,
-            "image_count": post.image_count,
-            "image_alts_json": post.image_alts,
+            "uri": row.uri,
+            "cid": row.cid,
+            "author_did": row.author_did,
+            "repo_did": row.repo_did,
+            "record_created_at": row.record_created_at,
+            "firehose_seq": row.firehose_seq,
+            "firehose_observed_at": row.firehose_observed_at,
+            "raw_embed_type": row.raw_embed_type,
+            "image_count": row.image_count,
+            "image_alts_json": row.image_alts_json,
         }
-        for post in posts
+        for row in rows
     ]
 
-    insert_stmt = insert(IntakeItem).values(rows)
+    insert_stmt = insert(IntakeItem).values(insert_rows)
     excluded = insert_stmt.excluded
 
     session.execute(
@@ -118,3 +131,5 @@ def upsert_intake_items(
             },
         )
     )
+
+    return len(insert_rows)
