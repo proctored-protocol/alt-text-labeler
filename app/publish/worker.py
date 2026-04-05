@@ -195,7 +195,7 @@ class PublishWorker:
                 uri=uri,
                 cid=cid,
                 label_value=label_value,
-                comment=None,
+                comment=f"Auto-applied by alt-labeler at {attempt_started_at.isoformat()}",
                 duration_in_hours=None,
             )
             finished_at = utc_now()
