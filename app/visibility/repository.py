@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import func, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -12,6 +13,12 @@ from app.models import WorkerHeartbeat
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def jsonb_param(value: dict | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +170,6 @@ def lease_visibility_batch(
         {
             "now": now,
             "batch_size": batch_size,
-            "lease_seconds": lease_seconds,
             "max_attempts": max_attempts,
         },
     ).mappings().all()
@@ -261,7 +267,7 @@ def mark_visibility_visible(
                 last_http_status = :http_status,
                 last_error_code = NULL,
                 last_error_text = NULL,
-                last_response_json = :response_json,
+                last_response_json = CAST(:response_json AS jsonb),
                 lease_owner = NULL,
                 lease_until = NULL,
                 updated_at = :now
@@ -271,7 +277,7 @@ def mark_visibility_visible(
             "id": visibility_check_id,
             "now": now,
             "http_status": http_status,
-            "response_json": response_json,
+            "response_json": jsonb_param(response_json),
         },
     )
 
@@ -301,7 +307,7 @@ def mark_visibility_pending_or_timeout(
                     last_http_status = :http_status,
                     last_error_code = 'visibility_timeout',
                     last_error_text = 'forced hydration label not visible within max age window',
-                    last_response_json = :response_json,
+                    last_response_json = CAST(:response_json AS jsonb),
                     lease_owner = NULL,
                     lease_until = NULL,
                     updated_at = :now
@@ -311,7 +317,7 @@ def mark_visibility_pending_or_timeout(
                 "id": visibility_check_id,
                 "now": now,
                 "http_status": http_status,
-                "response_json": response_json,
+                "response_json": jsonb_param(response_json),
             },
         )
         return
@@ -328,7 +334,7 @@ def mark_visibility_pending_or_timeout(
                 last_http_status = :http_status,
                 last_error_code = NULL,
                 last_error_text = NULL,
-                last_response_json = :response_json,
+                last_response_json = CAST(:response_json AS jsonb),
                 lease_owner = NULL,
                 lease_until = NULL,
                 updated_at = :now
@@ -339,7 +345,7 @@ def mark_visibility_pending_or_timeout(
             "now": now,
             "next_check_at": next_check_at,
             "http_status": http_status,
-            "response_json": response_json,
+            "response_json": jsonb_param(response_json),
         },
     )
 
@@ -374,7 +380,7 @@ def mark_visibility_error_or_retry(
                     last_http_status = :http_status,
                     last_error_code = :error_code,
                     last_error_text = :error_text,
-                    last_response_json = :response_json,
+                    last_response_json = CAST(:response_json AS jsonb),
                     lease_owner = NULL,
                     lease_until = NULL,
                     updated_at = :now
@@ -386,7 +392,7 @@ def mark_visibility_error_or_retry(
                 "http_status": http_status,
                 "error_code": error_code,
                 "error_text": error_text,
-                "response_json": response_json,
+                "response_json": jsonb_param(response_json),
             },
         )
         return
@@ -401,7 +407,7 @@ def mark_visibility_error_or_retry(
                     last_http_status = :http_status,
                     last_error_code = :error_code,
                     last_error_text = :error_text,
-                    last_response_json = :response_json,
+                    last_response_json = CAST(:response_json AS jsonb),
                     lease_owner = NULL,
                     lease_until = NULL,
                     updated_at = :now
@@ -413,7 +419,7 @@ def mark_visibility_error_or_retry(
                 "http_status": http_status,
                 "error_code": error_code,
                 "error_text": error_text,
-                "response_json": response_json,
+                "response_json": jsonb_param(response_json),
             },
         )
         return
@@ -430,7 +436,7 @@ def mark_visibility_error_or_retry(
                 last_http_status = :http_status,
                 last_error_code = :error_code,
                 last_error_text = :error_text,
-                last_response_json = :response_json,
+                last_response_json = CAST(:response_json AS jsonb),
                 lease_owner = NULL,
                 lease_until = NULL,
                 updated_at = :now
@@ -443,7 +449,7 @@ def mark_visibility_error_or_retry(
             "http_status": http_status,
             "error_code": error_code,
             "error_text": error_text,
-            "response_json": response_json,
+            "response_json": jsonb_param(response_json),
         },
     )
 
