@@ -29,6 +29,30 @@ class BufferedIntakePost:
     image_alts_json: Any
 
 
+def _clean_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.replace("\x00", "")
+
+
+def _clean_jsonish(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, list):
+        return [_clean_jsonish(v) for v in value]
+    if isinstance(value, tuple):
+        return [_clean_jsonish(v) for v in value]
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for k, v in value.items():
+            cleaned_key = "" if k is None else str(k).replace("\x00", "")
+            cleaned[cleaned_key] = _clean_jsonish(v)
+        return cleaned
+    return value
+
+
 def get_consumer_state(session: Session, consumer_name: str) -> ConsumerState | None:
     return session.execute(
         select(ConsumerState).where(ConsumerState.consumer_name == consumer_name)
@@ -55,8 +79,8 @@ def upsert_consumer_state(
         cursor_seq=cursor_seq,
         cursor_observed_at=cursor_observed_at,
         status=status,
-        last_error_code=last_error_code,
-        last_error_text=last_error_text,
+        last_error_code=_clean_text(last_error_code),
+        last_error_text=_clean_text(last_error_text),
         started_at=started_at,
     )
 
@@ -94,16 +118,16 @@ def upsert_intake_items(
 
     insert_rows = [
         {
-            "uri": row.uri,
-            "cid": row.cid,
-            "author_did": row.author_did,
-            "repo_did": row.repo_did,
+            "uri": _clean_text(row.uri),
+            "cid": _clean_text(row.cid),
+            "author_did": _clean_text(row.author_did),
+            "repo_did": _clean_text(row.repo_did),
             "record_created_at": row.record_created_at,
             "firehose_seq": row.firehose_seq,
             "firehose_observed_at": row.firehose_observed_at,
-            "raw_embed_type": row.raw_embed_type,
+            "raw_embed_type": _clean_text(row.raw_embed_type),
             "image_count": row.image_count,
-            "image_alts_json": row.image_alts_json,
+            "image_alts_json": _clean_jsonish(row.image_alts_json),
         }
         for row in rows
     ]
