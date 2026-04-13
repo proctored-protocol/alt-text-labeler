@@ -124,7 +124,10 @@ def lease_remediation_batch(
                     (vr.status = 'pending' AND vr.next_attempt_at <= :now)
                  OR (vr.status = 'leased' AND vr.lease_until IS NOT NULL AND vr.lease_until < :now)
               )
-            ORDER BY vr.next_attempt_at ASC, vr.id ASC
+            ORDER BY
+                vr.attempt_count DESC,
+                vr.next_attempt_at ASC,
+                vr.id ASC
             LIMIT :batch_size
             FOR UPDATE OF vr SKIP LOCKED
         """),

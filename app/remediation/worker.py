@@ -71,8 +71,8 @@ class VisibilityRemediationWorker:
 
         self.first_delay_seconds = self.settings.remediation_first_delay_seconds
         self.second_delay_seconds = self.settings.remediation_second_delay_seconds
-        self.check_timeout_seconds = self.settings.remediation_check_timeout_seconds
-        self.check_poll_seconds = self.settings.remediation_check_poll_seconds
+
+        self.verify_wait_seconds = max(1, int(self.settings.remediation_check_timeout_seconds))
         self.unlabel_sleep_seconds = self.settings.remediation_unlabel_sleep_seconds
 
         logger.info(
@@ -83,9 +83,9 @@ class VisibilityRemediationWorker:
                 "lease_seconds": self.lease_seconds,
                 "first_delay_seconds": self.first_delay_seconds,
                 "second_delay_seconds": self.second_delay_seconds,
-                "check_timeout_seconds": self.check_timeout_seconds,
-                "check_poll_seconds": self.check_poll_seconds,
+                "verify_wait_seconds": self.verify_wait_seconds,
                 "unlabel_sleep_seconds": self.unlabel_sleep_seconds,
+                "mode": "emit_then_single_check",
             },
         )
 
@@ -115,8 +115,8 @@ class VisibilityRemediationWorker:
                 meta_json={
                     "first_delay_seconds": self.first_delay_seconds,
                     "second_delay_seconds": self.second_delay_seconds,
-                    "check_timeout_seconds": self.check_timeout_seconds,
-                    "check_poll_seconds": self.check_poll_seconds,
+                    "verify_wait_seconds": self.verify_wait_seconds,
+                    "mode": "emit_then_single_check",
                 },
             )
 
@@ -128,7 +128,7 @@ class VisibilityRemediationWorker:
                 now = utc_now()
 
                 with session_scope() as session:
-                    seed_remediation_jobs(
+                    seeded = seed_remediation_jobs(
                         session,
                         first_delay_seconds=self.first_delay_seconds,
                         now=now,
@@ -152,14 +152,31 @@ class VisibilityRemediationWorker:
                     time.sleep(self.idle_sleep_seconds)
                     continue
 
+                logger.info(
+                    "visibility_remediation_batch_leased",
+                    extra={
+                        "worker_name": self.worker_name,
+                        "leased_count": len(leased),
+                        "seeded_count": seeded,
+                        "backlog_depth": backlog_depth,
+                    },
+                )
+
                 self._heartbeat(
                     status="running",
                     lease_count=len(leased),
                     backlog_depth=backlog_depth,
                 )
 
-                for ref in leased:
+                total = len(leased)
+                for idx, ref in enumerate(leased, start=1):
                     self._process_one(ref.id)
+                    remaining = total - idx
+                    self._heartbeat(
+                        status="running",
+                        lease_count=remaining,
+                        backlog_depth=backlog_depth,
+                    )
 
                 with session_scope() as session:
                     backlog_after = count_remediation_backlog(session)
@@ -181,6 +198,55 @@ class VisibilityRemediationWorker:
                 )
                 time.sleep(2.0)
 
+    def _schedule_or_give_up(
+        self,
+        *,
+        remediation_id: int,
+        attempt_no: int,
+        published_at: datetime,
+        http_status: int | None,
+        response_json: dict | list | None,
+        error_code: str,
+        error_text: str,
+        unlabel_event_id: str | None,
+        relabel_event_id: str | None,
+    ) -> None:
+        with session_scope() as session:
+            row = get_leased_remediation_for_worker(
+                session,
+                remediation_id=remediation_id,
+                worker_name=self.worker_name,
+            )
+            if row is None:
+                return
+
+            if attempt_no == 1:
+                mark_remediation_schedule_second(
+                    session,
+                    remediation_id=remediation_id,
+                    published_at=published_at,
+                    second_delay_seconds=self.second_delay_seconds,
+                    now=utc_now(),
+                    http_status=http_status,
+                    response_json=response_json,
+                    error_code=error_code,
+                    error_text=error_text,
+                    unlabel_event_id=unlabel_event_id,
+                    relabel_event_id=relabel_event_id,
+                )
+            else:
+                mark_remediation_gave_up(
+                    session,
+                    remediation_id=remediation_id,
+                    now=utc_now(),
+                    http_status=http_status,
+                    response_json=response_json,
+                    error_code=error_code,
+                    error_text=error_text,
+                    unlabel_event_id=unlabel_event_id,
+                    relabel_event_id=relabel_event_id,
+                )
+
     def _process_one(self, remediation_id: int) -> None:
         with session_scope() as session:
             row = get_leased_remediation_for_worker(
@@ -196,131 +262,6 @@ class VisibilityRemediationWorker:
             label_value = row["label_value"]
             published_at = row["published_at"]
             attempt_no = int(row["attempt_count"]) + 1
-
-        # First, see if it is already visible before any remediation action.
-        try:
-            pre = self.visibility_client.check_forced_hydration(
-                uri=uri,
-                label_value=label_value,
-            )
-            if pre.found_label:
-                with session_scope() as session:
-                    row = get_leased_remediation_for_worker(
-                        session,
-                        remediation_id=remediation_id,
-                        worker_name=self.worker_name,
-                    )
-                    if row is None:
-                        return
-
-                    mark_remediation_visible(
-                        session,
-                        remediation_id=remediation_id,
-                        attempt_no=attempt_no,
-                        now=utc_now(),
-                        http_status=pre.status_code,
-                        response_json=pre.payload,
-                        unlabel_event_id=None,
-                        relabel_event_id=None,
-                    )
-
-                logger.info(
-                    "visibility_remediation_already_visible",
-                    extra={
-                        "worker_name": self.worker_name,
-                        "remediation_id": remediation_id,
-                        "attempt_no": attempt_no,
-                        "uri": uri,
-                        "label_value": label_value,
-                    },
-                )
-                return
-
-        except VisibilityClientError as exc:
-            if exc.http_status == 400 and exc.error_code == "NotFound":
-                with session_scope() as session:
-                    row = get_leased_remediation_for_worker(
-                        session,
-                        remediation_id=remediation_id,
-                        worker_name=self.worker_name,
-                    )
-                    if row is None:
-                        return
-
-                    mark_remediation_not_found(
-                        session,
-                        remediation_id=remediation_id,
-                        attempt_no=attempt_no,
-                        now=utc_now(),
-                        http_status=exc.http_status,
-                        error_code=exc.error_code,
-                        error_text=exc.error_text,
-                        response_json=exc.response_json,
-                        unlabel_event_id=None,
-                        relabel_event_id=None,
-                    )
-
-                logger.info(
-                    "visibility_remediation_not_found_before_emit",
-                    extra={
-                        "worker_name": self.worker_name,
-                        "remediation_id": remediation_id,
-                        "attempt_no": attempt_no,
-                        "uri": uri,
-                        "label_value": label_value,
-                    },
-                )
-                return
-
-            with session_scope() as session:
-                row = get_leased_remediation_for_worker(
-                    session,
-                    remediation_id=remediation_id,
-                    worker_name=self.worker_name,
-                )
-                if row is None:
-                    return
-
-                if attempt_no == 1:
-                    mark_remediation_schedule_second(
-                        session,
-                        remediation_id=remediation_id,
-                        published_at=published_at,
-                        second_delay_seconds=self.second_delay_seconds,
-                        now=utc_now(),
-                        http_status=exc.http_status,
-                        response_json=exc.response_json,
-                        error_code=exc.error_code,
-                        error_text=exc.error_text,
-                        unlabel_event_id=None,
-                        relabel_event_id=None,
-                    )
-                else:
-                    mark_remediation_gave_up(
-                        session,
-                        remediation_id=remediation_id,
-                        now=utc_now(),
-                        http_status=exc.http_status,
-                        response_json=exc.response_json,
-                        error_code=exc.error_code,
-                        error_text=exc.error_text,
-                        unlabel_event_id=None,
-                        relabel_event_id=None,
-                    )
-
-            logger.warning(
-                "visibility_remediation_precheck_failed",
-                extra={
-                    "worker_name": self.worker_name,
-                    "remediation_id": remediation_id,
-                    "attempt_no": attempt_no,
-                    "uri": uri,
-                    "label_value": label_value,
-                    "http_status": exc.http_status,
-                    "error_code": exc.error_code,
-                },
-            )
-            return
 
         unlabel_event_id: str | None = None
         relabel_event_id: str | None = None
@@ -347,41 +288,17 @@ class VisibilityRemediationWorker:
                 relabel_event_id = str(relabel_resp["id"])
 
         except OzonePublishError as exc:
-            with session_scope() as session:
-                row = get_leased_remediation_for_worker(
-                    session,
-                    remediation_id=remediation_id,
-                    worker_name=self.worker_name,
-                )
-                if row is None:
-                    return
-
-                if attempt_no == 1:
-                    mark_remediation_schedule_second(
-                        session,
-                        remediation_id=remediation_id,
-                        published_at=published_at,
-                        second_delay_seconds=self.second_delay_seconds,
-                        now=utc_now(),
-                        http_status=exc.http_status,
-                        response_json=exc.response_json,
-                        error_code=exc.error_code,
-                        error_text=exc.error_text,
-                        unlabel_event_id=unlabel_event_id,
-                        relabel_event_id=relabel_event_id,
-                    )
-                else:
-                    mark_remediation_gave_up(
-                        session,
-                        remediation_id=remediation_id,
-                        now=utc_now(),
-                        http_status=exc.http_status,
-                        response_json=exc.response_json,
-                        error_code=exc.error_code,
-                        error_text=exc.error_text,
-                        unlabel_event_id=unlabel_event_id,
-                        relabel_event_id=relabel_event_id,
-                    )
+            self._schedule_or_give_up(
+                remediation_id=remediation_id,
+                attempt_no=attempt_no,
+                published_at=published_at,
+                http_status=exc.http_status,
+                response_json=exc.response_json,
+                error_code=exc.error_code,
+                error_text=exc.error_text,
+                unlabel_event_id=unlabel_event_id,
+                relabel_event_id=relabel_event_id,
+            )
 
             logger.warning(
                 "visibility_remediation_emit_failed",
@@ -397,139 +314,127 @@ class VisibilityRemediationWorker:
             )
             return
 
-        deadline = time.monotonic() + self.check_timeout_seconds
-        last_http_status: int | None = None
-        last_payload = None
+        time.sleep(self.verify_wait_seconds)
 
-        while True:
-            try:
-                result = self.visibility_client.check_forced_hydration(
-                    uri=uri,
-                    label_value=label_value,
-                )
-                last_http_status = result.status_code
-                last_payload = result.payload
-
-                if result.found_label:
-                    with session_scope() as session:
-                        row = get_leased_remediation_for_worker(
-                            session,
-                            remediation_id=remediation_id,
-                            worker_name=self.worker_name,
-                        )
-                        if row is None:
-                            return
-
-                        mark_remediation_visible(
-                            session,
-                            remediation_id=remediation_id,
-                            attempt_no=attempt_no,
-                            now=utc_now(),
-                            http_status=result.status_code,
-                            response_json=result.payload,
-                            unlabel_event_id=unlabel_event_id,
-                            relabel_event_id=relabel_event_id,
-                        )
-
-                    logger.info(
-                        "visibility_remediation_visible",
-                        extra={
-                            "worker_name": self.worker_name,
-                            "remediation_id": remediation_id,
-                            "attempt_no": attempt_no,
-                            "uri": uri,
-                            "label_value": label_value,
-                        },
-                    )
-                    return
-
-            except VisibilityClientError as exc:
-                if exc.http_status == 400 and exc.error_code == "NotFound":
-                    with session_scope() as session:
-                        row = get_leased_remediation_for_worker(
-                            session,
-                            remediation_id=remediation_id,
-                            worker_name=self.worker_name,
-                        )
-                        if row is None:
-                            return
-
-                        mark_remediation_not_found(
-                            session,
-                            remediation_id=remediation_id,
-                            attempt_no=attempt_no,
-                            now=utc_now(),
-                            http_status=exc.http_status,
-                            error_code=exc.error_code,
-                            error_text=exc.error_text,
-                            response_json=exc.response_json,
-                            unlabel_event_id=unlabel_event_id,
-                            relabel_event_id=relabel_event_id,
-                        )
-
-                    logger.info(
-                        "visibility_remediation_not_found_after_emit",
-                        extra={
-                            "worker_name": self.worker_name,
-                            "remediation_id": remediation_id,
-                            "attempt_no": attempt_no,
-                            "uri": uri,
-                            "label_value": label_value,
-                        },
-                    )
-                    return
-
-                last_http_status = exc.http_status
-                last_payload = exc.response_json
-
-            if time.monotonic() >= deadline:
-                break
-
-            time.sleep(self.check_poll_seconds)
-
-        with session_scope() as session:
-            row = get_leased_remediation_for_worker(
-                session,
-                remediation_id=remediation_id,
-                worker_name=self.worker_name,
+        try:
+            result = self.visibility_client.check_forced_hydration(
+                uri=uri,
+                label_value=label_value,
             )
-            if row is None:
+            if result.found_label:
+                with session_scope() as session:
+                    row = get_leased_remediation_for_worker(
+                        session,
+                        remediation_id=remediation_id,
+                        worker_name=self.worker_name,
+                    )
+                    if row is None:
+                        return
+
+                    mark_remediation_visible(
+                        session,
+                        remediation_id=remediation_id,
+                        attempt_no=attempt_no,
+                        now=utc_now(),
+                        http_status=result.status_code,
+                        response_json=result.payload,
+                        unlabel_event_id=unlabel_event_id,
+                        relabel_event_id=relabel_event_id,
+                    )
+
+                logger.info(
+                    "visibility_remediation_visible",
+                    extra={
+                        "worker_name": self.worker_name,
+                        "remediation_id": remediation_id,
+                        "attempt_no": attempt_no,
+                        "uri": uri,
+                        "label_value": label_value,
+                    },
+                )
                 return
 
-            if attempt_no == 1:
-                mark_remediation_schedule_second(
-                    session,
-                    remediation_id=remediation_id,
-                    published_at=published_at,
-                    second_delay_seconds=self.second_delay_seconds,
-                    now=utc_now(),
-                    http_status=last_http_status,
-                    response_json=last_payload,
-                    error_code="still_not_visible",
-                    error_text="forced hydration still missing after first remediation",
-                    unlabel_event_id=unlabel_event_id,
-                    relabel_event_id=relabel_event_id,
-                )
-            else:
-                mark_remediation_gave_up(
-                    session,
-                    remediation_id=remediation_id,
-                    now=utc_now(),
-                    http_status=last_http_status,
-                    response_json=last_payload,
-                    error_code="still_not_visible",
-                    error_text="forced hydration still missing after second remediation",
-                    unlabel_event_id=unlabel_event_id,
-                    relabel_event_id=relabel_event_id,
-                )
+            self._schedule_or_give_up(
+                remediation_id=remediation_id,
+                attempt_no=attempt_no,
+                published_at=published_at,
+                http_status=result.status_code,
+                response_json=result.payload,
+                error_code="still_not_visible",
+                error_text="forced hydration still missing after remediation",
+                unlabel_event_id=unlabel_event_id,
+                relabel_event_id=relabel_event_id,
+            )
 
-        logger.warning(
-            "visibility_remediation_still_not_visible",
-            extra={
-                "worker_name": self.worker_name,
-                "remediation_id": remediation_id,
-                "attempt_no": attempt_no,
-                "uri": uri,
-                "label_value": label_value,
-            },
-        )
+            logger.warning(
+                "visibility_remediation_still_not_visible",
+                extra={
+                    "worker_name": self.worker_name,
+                    "remediation_id": remediation_id,
+                    "attempt_no": attempt_no,
+                    "uri": uri,
+                    "label_value": label_value,
+                },
+            )
+            return
+
+        except VisibilityClientError as exc:
+            if exc.http_status == 400 and exc.error_code == "NotFound":
+                with session_scope() as session:
+                    row = get_leased_remediation_for_worker(
+                        session,
+                        remediation_id=remediation_id,
+                        worker_name=self.worker_name,
+                    )
+                    if row is None:
+                        return
+
+                    mark_remediation_not_found(
+                        session,
+                        remediation_id=remediation_id,
+                        attempt_no=attempt_no,
+                        now=utc_now(),
+                        http_status=exc.http_status,
+                        error_code=exc.error_code,
+                        error_text=exc.error_text,
+                        response_json=exc.response_json,
+                        unlabel_event_id=unlabel_event_id,
+                        relabel_event_id=relabel_event_id,
+                    )
+
+                logger.info(
+                    "visibility_remediation_not_found_after_emit",
+                    extra={
+                        "worker_name": self.worker_name,
+                        "remediation_id": remediation_id,
+                        "attempt_no": attempt_no,
+                        "uri": uri,
+                        "label_value": label_value,
+                    },
+                )
+                return
+
+            self._schedule_or_give_up(
+                remediation_id=remediation_id,
+                attempt_no=attempt_no,
+                published_at=published_at,
+                http_status=exc.http_status,
+                response_json=exc.response_json,
+                error_code=exc.error_code,
+                error_text=exc.error_text,
+                unlabel_event_id=unlabel_event_id,
+                relabel_event_id=relabel_event_id,
+            )
+
+            logger.warning(
+                "visibility_remediation_check_failed",
+                extra={
+                    "worker_name": self.worker_name,
+                    "remediation_id": remediation_id,
+                    "attempt_no": attempt_no,
+                    "uri": uri,
+                    "label_value": label_value,
+                    "http_status": exc.http_status,
+                    "error_code": exc.error_code,
+                },
+            )
