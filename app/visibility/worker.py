@@ -14,8 +14,9 @@ from app.visibility.repository import (
     get_leased_visibility_check_for_worker,
     lease_visibility_batch,
     mark_old_pending_timeouts,
-    mark_visibility_error_or_retry,
-    mark_visibility_pending_or_timeout,
+    mark_visibility_not_found,
+    mark_visibility_not_visible,
+    mark_visibility_retry_or_error,
     mark_visibility_visible,
     seed_visibility_checks,
     upsert_worker_heartbeat,
@@ -58,6 +59,7 @@ class VisibilityWorker:
         self.max_attempts = self.settings.visibility_max_attempts
         self.retry_seconds = self.settings.visibility_retry_seconds
         self.max_age_seconds = self.settings.visibility_max_age_seconds
+        self.initial_delay_seconds = self.settings.visibility_initial_delay_seconds
 
         logger.info(
             "visibility_worker_initialized",
@@ -67,7 +69,8 @@ class VisibilityWorker:
                 "lease_seconds": self.lease_seconds,
                 "retry_seconds": self.retry_seconds,
                 "max_age_seconds": self.max_age_seconds,
-                "forced_hydration_only": True,
+                "initial_delay_seconds": self.initial_delay_seconds,
+                "mode": "baseline_5m_forced_hydration",
             },
         )
 
@@ -95,11 +98,12 @@ class VisibilityWorker:
                 last_error_code=last_error_code,
                 last_error_text=last_error_text,
                 meta_json={
-                    "forced_hydration_only": True,
+                    "mode": "baseline_5m_forced_hydration",
                     "labeler_did": self.settings.verifier_labeler_did,
                     "appview_url": self.settings.verifier_appview_url,
                     "retry_seconds": self.retry_seconds,
                     "max_age_seconds": self.max_age_seconds,
+                    "initial_delay_seconds": self.initial_delay_seconds,
                 },
             )
 
@@ -114,6 +118,7 @@ class VisibilityWorker:
                     seed_visibility_checks(
                         session,
                         max_age_seconds=self.max_age_seconds,
+                        initial_delay_seconds=self.initial_delay_seconds,
                         now=now,
                     )
                     mark_old_pending_timeouts(
@@ -182,9 +187,7 @@ class VisibilityWorker:
             uri = row["uri"]
             label_value = row["label_value"]
             published_at = row["published_at"]
-            check_count = int(row["check_count"])
-
-        started_at = utc_now()
+            attempt_count = int(row["attempt_count"])
 
         try:
             result = self.client.check_forced_hydration(
@@ -220,18 +223,15 @@ class VisibilityWorker:
                         },
                     )
                 else:
-                    mark_visibility_pending_or_timeout(
+                    mark_visibility_not_visible(
                         session,
                         visibility_check_id=visibility_check_id,
                         now=finished_at,
-                        published_at=published_at,
-                        retry_seconds=self.retry_seconds,
-                        max_age_seconds=self.max_age_seconds,
                         http_status=result.status_code,
                         response_json=result.payload,
                     )
                     logger.info(
-                        "visibility_check_not_yet_visible",
+                        "visibility_check_not_visible_5m",
                         extra={
                             "worker_name": self.worker_name,
                             "visibility_check_id": visibility_check_id,
@@ -252,30 +252,49 @@ class VisibilityWorker:
                 if row is None:
                     return
 
-                mark_visibility_error_or_retry(
-                    session,
-                    visibility_check_id=visibility_check_id,
-                    check_count=check_count,
-                    published_at=published_at,
-                    now=finished_at,
-                    retry_seconds=self.retry_seconds,
-                    max_age_seconds=self.max_age_seconds,
-                    max_attempts=self.max_attempts,
-                    http_status=exc.http_status,
-                    error_code=exc.error_code,
-                    error_text=exc.error_text,
-                    response_json=exc.response_json,
-                    retryable=exc.retryable,
-                )
-
-            logger.warning(
-                "visibility_check_failed",
-                extra={
-                    "worker_name": self.worker_name,
-                    "visibility_check_id": visibility_check_id,
-                    "uri": uri,
-                    "label_value": label_value,
-                    "http_status": exc.http_status,
-                    "error_code": exc.error_code,
-                },
-            )
+                if exc.http_status == 400 and exc.error_code == "NotFound":
+                    mark_visibility_not_found(
+                        session,
+                        visibility_check_id=visibility_check_id,
+                        now=finished_at,
+                        http_status=exc.http_status,
+                        error_code=exc.error_code,
+                        error_text=exc.error_text,
+                        response_json=exc.response_json,
+                    )
+                    logger.info(
+                        "visibility_check_not_found",
+                        extra={
+                            "worker_name": self.worker_name,
+                            "visibility_check_id": visibility_check_id,
+                            "uri": uri,
+                            "label_value": label_value,
+                        },
+                    )
+                else:
+                    mark_visibility_retry_or_error(
+                        session,
+                        visibility_check_id=visibility_check_id,
+                        attempt_count=attempt_count,
+                        published_at=published_at,
+                        now=finished_at,
+                        retry_seconds=self.retry_seconds,
+                        max_age_seconds=self.max_age_seconds,
+                        max_attempts=self.max_attempts,
+                        http_status=exc.http_status,
+                        error_code=exc.error_code,
+                        error_text=exc.error_text,
+                        response_json=exc.response_json,
+                        retryable=exc.retryable,
+                    )
+                    logger.warning(
+                        "visibility_check_failed",
+                        extra={
+                            "worker_name": self.worker_name,
+                            "visibility_check_id": visibility_check_id,
+                            "uri": uri,
+                            "label_value": label_value,
+                            "http_status": exc.http_status,
+                            "error_code": exc.error_code,
+                        },
+                    )

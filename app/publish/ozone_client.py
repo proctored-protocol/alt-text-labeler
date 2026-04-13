@@ -281,19 +281,20 @@ class OzoneClient:
         )
         return resp.json_body or {}
 
-    def emit_label(
+    def emit_label_event(
         self,
         *,
         uri: str,
         cid: str,
-        label_value: str,
+        create_label_vals: list[str],
+        negate_label_vals: list[str],
         comment: str | None = None,
         duration_in_hours: int | None = None,
     ) -> dict[str, Any]:
         event: dict[str, Any] = {
             "$type": "tools.ozone.moderation.defs#modEventLabel",
-            "createLabelVals": [label_value],
-            "negateLabelVals": [],
+            "createLabelVals": create_label_vals,
+            "negateLabelVals": negate_label_vals,
         }
 
         if comment:
@@ -317,3 +318,39 @@ class OzoneClient:
             payload=payload,
         )
         return resp.json_body or {}
+
+    def emit_label(
+        self,
+        *,
+        uri: str,
+        cid: str,
+        label_value: str,
+        comment: str | None = None,
+        duration_in_hours: int | None = None,
+    ) -> dict[str, Any]:
+        return self.emit_label_event(
+            uri=uri,
+            cid=cid,
+            create_label_vals=[label_value],
+            negate_label_vals=[],
+            comment=comment,
+            duration_in_hours=duration_in_hours,
+        )
+
+    def negate_label(
+        self,
+        *,
+        uri: str,
+        cid: str,
+        label_value: str,
+        comment: str | None = None,
+        duration_in_hours: int | None = None,
+    ) -> dict[str, Any]:
+        return self.emit_label_event(
+            uri=uri,
+            cid=cid,
+            create_label_vals=[],
+            negate_label_vals=[label_value],
+            comment=comment,
+            duration_in_hours=duration_in_hours,
+        )

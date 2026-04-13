@@ -275,6 +275,12 @@ class PublishJob(Base):
         cascade="all, delete-orphan",
         uselist=False,
     )
+    visibility_remediation: Mapped[VisibilityRemediation | None] = relationship(
+        "VisibilityRemediation",
+        back_populates="publish_job",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class PublishAttempt(Base):
@@ -370,6 +376,67 @@ class VisibilityCheck(Base):
     )
 
     publish_job: Mapped[PublishJob] = relationship("PublishJob", back_populates="visibility_check")
+
+
+class VisibilityRemediation(Base):
+    __tablename__ = "visibility_remediation"
+    __table_args__ = (
+        UniqueConstraint("publish_job_id", name="uq_visibility_remediation_publish_job_id"),
+        CheckConstraint("attempt_count >= 0", name="ck_visibility_remediation_attempt_count_nonnegative"),
+        Index("ix_visibility_remediation_status_next_attempt_at", "status", "next_attempt_at"),
+        Index("ix_visibility_remediation_lease_until", "lease_until"),
+        Index("ix_visibility_remediation_resolved_at", "resolved_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    publish_job_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("publish_job.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", server_default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    first_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_found_label: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    first_unlabel_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_relabel_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    second_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    second_found_label: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    second_unlabel_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    second_relabel_event_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_response_json: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    publish_job: Mapped[PublishJob] = relationship("PublishJob", back_populates="visibility_remediation")
 
 
 class WorkerHeartbeat(Base):

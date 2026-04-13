@@ -15,7 +15,7 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def jsonb_param(value: dict | None) -> str | None:
+def jsonb_param(value: dict | list | None) -> str | None:
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False)
@@ -35,6 +35,7 @@ def seed_visibility_checks(
     session: Session,
     *,
     max_age_seconds: int,
+    initial_delay_seconds: int,
     now: datetime | None = None,
 ) -> int:
     now = now or utc_now()
@@ -44,8 +45,8 @@ def seed_visibility_checks(
             INSERT INTO visibility_check (
                 publish_job_id,
                 status,
-                check_count,
-                next_check_at,
+                attempt_count,
+                next_attempt_at,
                 created_at,
                 updated_at
             )
@@ -53,7 +54,7 @@ def seed_visibility_checks(
                 pj.id,
                 'pending',
                 0,
-                :now,
+                pj.published_at + (:initial_delay_seconds * INTERVAL '1 second'),
                 :now,
                 :now
             FROM publish_job pj
@@ -67,6 +68,7 @@ def seed_visibility_checks(
         {
             "now": now,
             "max_age_seconds": max_age_seconds,
+            "initial_delay_seconds": initial_delay_seconds,
         },
     )
     return int(result.rowcount or 0)
@@ -89,13 +91,12 @@ def mark_old_pending_timeouts(
                 lease_until = NULL,
                 last_checked_at = :now,
                 last_error_code = 'visibility_timeout',
-                last_error_text = 'forced hydration label not visible within max age window',
+                last_error_text = 'baseline forced hydration check not completed within max age window',
                 updated_at = :now
             FROM publish_job pj
             WHERE pj.id = vc.publish_job_id
               AND pj.status = 'published'
               AND vc.status IN ('pending', 'leased')
-              AND vc.first_forced_visible_at IS NULL
               AND pj.published_at IS NOT NULL
               AND pj.published_at < (:now - (:max_age_seconds * INTERVAL '1 second'))
         """),
@@ -122,7 +123,7 @@ def count_visibility_backlog(
               ON pj.id = vc.publish_job_id
             WHERE pj.status = 'published'
               AND (
-                    (vc.status = 'pending' AND vc.next_check_at <= :now)
+                    (vc.status = 'pending' AND vc.next_attempt_at <= :now)
                  OR (vc.status = 'leased' AND vc.lease_until IS NOT NULL AND vc.lease_until < :now)
               )
         """),
@@ -149,7 +150,6 @@ def lease_visibility_batch(
             SELECT
                 vc.id,
                 vc.publish_job_id,
-                vc.check_count,
                 pj.uri,
                 pj.cid,
                 pj.label_value,
@@ -158,12 +158,12 @@ def lease_visibility_batch(
             JOIN publish_job pj
               ON pj.id = vc.publish_job_id
             WHERE pj.status = 'published'
-              AND vc.check_count < :max_attempts
+              AND vc.attempt_count < :max_attempts
               AND (
-                    (vc.status = 'pending' AND vc.next_check_at <= :now)
+                    (vc.status = 'pending' AND vc.next_attempt_at <= :now)
                  OR (vc.status = 'leased' AND vc.lease_until IS NOT NULL AND vc.lease_until < :now)
               )
-            ORDER BY pj.published_at ASC, vc.id ASC
+            ORDER BY vc.next_attempt_at ASC, pj.published_at ASC, vc.id ASC
             LIMIT :batch_size
             FOR UPDATE OF vc SKIP LOCKED
         """),
@@ -182,7 +182,7 @@ def lease_visibility_batch(
                 UPDATE visibility_check
                 SET
                     status = 'leased',
-                    check_count = check_count + 1,
+                    attempt_count = attempt_count + 1,
                     lease_owner = :worker_name,
                     lease_until = :lease_until,
                     updated_at = :now
@@ -222,9 +222,7 @@ def get_leased_visibility_check_for_worker(
                 vc.id,
                 vc.publish_job_id,
                 vc.status,
-                vc.check_count,
-                vc.first_forced_visible_at,
-                vc.last_forced_visible_at,
+                vc.attempt_count,
                 vc.last_checked_at,
                 vc.last_http_status,
                 vc.last_error_code,
@@ -254,15 +252,16 @@ def mark_visibility_visible(
     visibility_check_id: int,
     now: datetime,
     http_status: int,
-    response_json: dict | None,
+    response_json: dict | list | None,
 ) -> None:
     session.execute(
         text("""
             UPDATE visibility_check
             SET
                 status = 'visible',
-                first_forced_visible_at = COALESCE(first_forced_visible_at, :now),
-                last_forced_visible_at = :now,
+                visible_at = COALESCE(visible_at, :now),
+                forced_found = TRUE,
+                forced_status_code = :http_status,
                 last_checked_at = :now,
                 last_http_status = :http_status,
                 last_error_code = NULL,
@@ -282,54 +281,21 @@ def mark_visibility_visible(
     )
 
 
-def mark_visibility_pending_or_timeout(
+def mark_visibility_not_visible(
     session: Session,
     *,
     visibility_check_id: int,
     now: datetime,
-    published_at: datetime | None,
-    retry_seconds: int,
-    max_age_seconds: int,
     http_status: int,
-    response_json: dict | None,
+    response_json: dict | list | None,
 ) -> None:
-    timed_out = False
-    if published_at is not None:
-        timed_out = (now - published_at).total_seconds() >= max_age_seconds
-
-    if timed_out:
-        session.execute(
-            text("""
-                UPDATE visibility_check
-                SET
-                    status = 'timeout',
-                    last_checked_at = :now,
-                    last_http_status = :http_status,
-                    last_error_code = 'visibility_timeout',
-                    last_error_text = 'forced hydration label not visible within max age window',
-                    last_response_json = CAST(:response_json AS jsonb),
-                    lease_owner = NULL,
-                    lease_until = NULL,
-                    updated_at = :now
-                WHERE id = :id
-            """),
-            {
-                "id": visibility_check_id,
-                "now": now,
-                "http_status": http_status,
-                "response_json": jsonb_param(response_json),
-            },
-        )
-        return
-
-    next_check_at = now + timedelta(seconds=retry_seconds)
-
     session.execute(
         text("""
             UPDATE visibility_check
             SET
-                status = 'pending',
-                next_check_at = :next_check_at,
+                status = 'not_visible',
+                forced_found = FALSE,
+                forced_status_code = :http_status,
                 last_checked_at = :now,
                 last_http_status = :http_status,
                 last_error_code = NULL,
@@ -343,18 +309,55 @@ def mark_visibility_pending_or_timeout(
         {
             "id": visibility_check_id,
             "now": now,
-            "next_check_at": next_check_at,
             "http_status": http_status,
             "response_json": jsonb_param(response_json),
         },
     )
 
 
-def mark_visibility_error_or_retry(
+def mark_visibility_not_found(
     session: Session,
     *,
     visibility_check_id: int,
-    check_count: int,
+    now: datetime,
+    http_status: int | None,
+    error_code: str,
+    error_text: str,
+    response_json: dict | list | None,
+) -> None:
+    session.execute(
+        text("""
+            UPDATE visibility_check
+            SET
+                status = 'not_found',
+                forced_found = FALSE,
+                forced_status_code = :http_status,
+                last_checked_at = :now,
+                last_http_status = :http_status,
+                last_error_code = :error_code,
+                last_error_text = :error_text,
+                last_response_json = CAST(:response_json AS jsonb),
+                lease_owner = NULL,
+                lease_until = NULL,
+                updated_at = :now
+            WHERE id = :id
+        """),
+        {
+            "id": visibility_check_id,
+            "now": now,
+            "http_status": http_status,
+            "error_code": error_code,
+            "error_text": error_text,
+            "response_json": jsonb_param(response_json),
+        },
+    )
+
+
+def mark_visibility_retry_or_error(
+    session: Session,
+    *,
+    visibility_check_id: int,
+    attempt_count: int,
     published_at: datetime | None,
     now: datetime,
     retry_seconds: int,
@@ -363,7 +366,7 @@ def mark_visibility_error_or_retry(
     http_status: int | None,
     error_code: str,
     error_text: str,
-    response_json: dict | None,
+    response_json: dict | list | None,
     retryable: bool,
 ) -> None:
     timed_out = False
@@ -397,12 +400,14 @@ def mark_visibility_error_or_retry(
         )
         return
 
-    if (not retryable) or check_count >= max_attempts:
+    if retryable and attempt_count < max_attempts:
+        next_check_at = now + timedelta(seconds=retry_seconds)
         session.execute(
             text("""
                 UPDATE visibility_check
                 SET
-                    status = 'error',
+                    status = 'pending',
+                    next_check_at = :next_check_at,
                     last_checked_at = :now,
                     last_http_status = :http_status,
                     last_error_code = :error_code,
@@ -416,6 +421,7 @@ def mark_visibility_error_or_retry(
             {
                 "id": visibility_check_id,
                 "now": now,
+                "next_check_at": next_check_at,
                 "http_status": http_status,
                 "error_code": error_code,
                 "error_text": error_text,
@@ -424,14 +430,11 @@ def mark_visibility_error_or_retry(
         )
         return
 
-    next_check_at = now + timedelta(seconds=retry_seconds)
-
     session.execute(
         text("""
             UPDATE visibility_check
             SET
-                status = 'pending',
-                next_check_at = :next_check_at,
+                status = 'error',
                 last_checked_at = :now,
                 last_http_status = :http_status,
                 last_error_code = :error_code,
@@ -445,7 +448,6 @@ def mark_visibility_error_or_retry(
         {
             "id": visibility_check_id,
             "now": now,
-            "next_check_at": next_check_at,
             "http_status": http_status,
             "error_code": error_code,
             "error_text": error_text,

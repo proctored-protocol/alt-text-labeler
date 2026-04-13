@@ -60,15 +60,30 @@ class Settings(BaseSettings):
     publish_max_attempts: int = Field(default=10)
     publish_backoff_base_seconds: int = Field(default=15)
 
-    # --- visibility worker ---------------------------------------------------
+    # --- visibility baseline worker -----------------------------------------
 
     visibility_batch_size: int = Field(default=50)
     visibility_lease_seconds: int = Field(default=180)
     visibility_idle_sleep_seconds: float = Field(default=1.0)
-    visibility_max_attempts: int = Field(default=20)
+    visibility_max_attempts: int = Field(default=5)
     visibility_retry_seconds: int = Field(default=30)
-    visibility_max_age_seconds: int = Field(default=1800)
+    visibility_max_age_seconds: int = Field(default=7200)
     visibility_request_timeout_seconds: int = Field(default=30)
+    visibility_initial_delay_seconds: int = Field(default=300)
+
+    # --- visibility remediation worker --------------------------------------
+
+    remediation_batch_size: int = Field(default=50)
+    remediation_lease_seconds: int = Field(default=180)
+    remediation_idle_sleep_seconds: float = Field(default=1.0)
+    remediation_max_attempts: int = Field(default=2)
+
+    remediation_first_delay_seconds: int = Field(default=300)
+    remediation_second_delay_seconds: int = Field(default=600)
+
+    remediation_check_timeout_seconds: int = Field(default=90)
+    remediation_check_poll_seconds: int = Field(default=5)
+    remediation_unlabel_sleep_seconds: float = Field(default=2.0)
 
     # --- control plane / watchdog -------------------------------------------
 
