@@ -57,12 +57,10 @@ def seed_remediation_jobs(
             FROM visibility_check vc
             JOIN publish_job pj
               ON pj.id = vc.publish_job_id
-            LEFT JOIN visibility_remediation vr
-              ON vr.publish_job_id = pj.id
             WHERE vc.status = 'not_visible'
               AND pj.status = 'published'
               AND pj.published_at IS NOT NULL
-              AND vr.id IS NULL
+            ON CONFLICT (publish_job_id) DO NOTHING
         """),
         {
             "now": now,

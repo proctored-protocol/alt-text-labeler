@@ -58,12 +58,10 @@ def seed_visibility_checks(
                 :now,
                 :now
             FROM publish_job pj
-            LEFT JOIN visibility_check vc
-                ON vc.publish_job_id = pj.id
             WHERE pj.status = 'published'
               AND pj.published_at IS NOT NULL
               AND pj.published_at >= (:now - (:max_age_seconds * INTERVAL '1 second'))
-              AND vc.id IS NULL
+            ON CONFLICT (publish_job_id) DO NOTHING
         """),
         {
             "now": now,
@@ -407,7 +405,7 @@ def mark_visibility_retry_or_error(
                 UPDATE visibility_check
                 SET
                     status = 'pending',
-                    next_check_at = :next_check_at,
+                    next_attempt_at = :next_check_at,
                     last_checked_at = :now,
                     last_http_status = :http_status,
                     last_error_code = :error_code,
