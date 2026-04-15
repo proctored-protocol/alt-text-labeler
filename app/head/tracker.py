@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from atproto import CAR, FirehoseSubscribeReposClient, models, parse_subscribe_repos_message
@@ -103,6 +103,79 @@ def _extract_media_flags_from_embed(embed: Any) -> tuple[bool, bool]:
         return is_gif, False
 
     return False, False
+
+
+def _count_usable_alts(image_alts: list[str | None]) -> int:
+    return sum(1 for alt in image_alts if isinstance(alt, str) and alt.strip())
+
+
+def _normalize_derived_label(
+    result: Any,
+    *,
+    image_alts: list[str | None],
+    missing_label: str,
+    partial_label: str,
+) -> str | None:
+    """
+    Support both old tuple-returning and new object-returning derive_post_label() APIs.
+
+    Accepted shapes:
+    - (image_count, usable_alt_count, derived_label)
+    - object with attributes like:
+        image_count, usable_alt_count, label_value / derived_label / decision_outcome
+    """
+
+    candidate_label: Any = None
+    image_count: int | None = None
+    usable_alt_count: int | None = None
+
+    if isinstance(result, (tuple, list)):
+        if len(result) >= 1:
+            image_count = int(result[0]) if result[0] is not None else None
+        if len(result) >= 2:
+            usable_alt_count = int(result[1]) if result[1] is not None else None
+        if len(result) >= 3:
+            candidate_label = result[2]
+    else:
+        for attr_name in ("image_count",):
+            if hasattr(result, attr_name):
+                raw = getattr(result, attr_name)
+                if raw is not None:
+                    image_count = int(raw)
+                break
+
+        for attr_name in ("usable_alt_count",):
+            if hasattr(result, attr_name):
+                raw = getattr(result, attr_name)
+                if raw is not None:
+                    usable_alt_count = int(raw)
+                break
+
+        for attr_name in ("label_value", "derived_label", "decision_outcome", "label", "outcome"):
+            if hasattr(result, attr_name):
+                candidate_label = getattr(result, attr_name)
+                if candidate_label is not None:
+                    break
+
+    if candidate_label == "no_label":
+        candidate_label = None
+
+    if candidate_label in {missing_label, partial_label}:
+        return str(candidate_label)
+
+    # Fallback if the result object does not directly expose a usable label string.
+    if image_count is None:
+        image_count = len(image_alts)
+    if usable_alt_count is None:
+        usable_alt_count = _count_usable_alts(image_alts)
+
+    if image_count <= 0:
+        return None
+    if usable_alt_count == 0:
+        return missing_label
+    if 0 < usable_alt_count < image_count:
+        return partial_label
+    return None
 
 
 @dataclass(slots=True)
@@ -326,7 +399,13 @@ class FirehoseHeadTracker:
 
             self.current_bucket.image_post_count += 1
 
-            _image_count, _usable_alt_count, derived_label = derive_post_label(
+            decision = derive_post_label(
+                image_alts=image_alts,
+                missing_label=self.settings.label_missing_alt,
+                partial_label=self.settings.label_partial_alt,
+            )
+            derived_label = _normalize_derived_label(
+                decision,
                 image_alts=image_alts,
                 missing_label=self.settings.label_missing_alt,
                 partial_label=self.settings.label_partial_alt,
