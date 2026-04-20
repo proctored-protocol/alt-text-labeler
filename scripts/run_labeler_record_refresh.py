@@ -57,13 +57,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run exactly one reset attempt and exit.",
     )
+    parser.add_argument(
+        "--login-host",
+        default=os.environ.get("RESET_LOGIN_HOST", ""),
+        help="Optional login host passed through to the reset script.",
+    )
     return parser.parse_args()
 
 
-def run_once(repo_root: Path, reset_script: str, timeout_seconds: int) -> dict:
+def run_once(repo_root: Path, reset_script: str, timeout_seconds: int, login_host: str) -> dict:
     started_at = now_iso()
+    cmd = ["python", reset_script]
+    if login_host.strip():
+        cmd.extend(["--login-host", login_host.strip()])
+
     proc = subprocess.run(
-        ["python", reset_script],
+        cmd,
         cwd=str(repo_root),
         text=True,
         capture_output=True,
@@ -75,11 +84,12 @@ def run_once(repo_root: Path, reset_script: str, timeout_seconds: int) -> dict:
         "started_at": started_at,
         "finished_at": now_iso(),
         "reset_script": reset_script,
+        "login_host": login_host.strip() or None,
         "returncode": proc.returncode,
         "stdout_tail": proc.stdout[-4000:],
         "stderr_tail": proc.stderr[-4000:],
+        "success": proc.returncode == 0,
     }
-    payload["success"] = proc.returncode == 0
     return payload
 
 
@@ -106,6 +116,7 @@ def main() -> None:
         "timeout_seconds": args.timeout_seconds,
         "startup_reset": bool(args.startup_reset),
         "once": bool(args.once),
+        "login_host": args.login_host.strip() or None,
         "log_path": str(log_path),
     }
     append_jsonl(log_path, startup)
@@ -113,14 +124,14 @@ def main() -> None:
     if args.once:
         append_jsonl(
             log_path,
-            run_once(repo_root, args.reset_script, args.timeout_seconds),
+            run_once(repo_root, args.reset_script, args.timeout_seconds, args.login_host),
         )
         return
 
     if args.startup_reset:
         append_jsonl(
             log_path,
-            run_once(repo_root, args.reset_script, args.timeout_seconds),
+            run_once(repo_root, args.reset_script, args.timeout_seconds, args.login_host),
         )
 
     while True:
@@ -133,12 +144,11 @@ def main() -> None:
         }
         append_jsonl(log_path, heartbeat)
 
-        sleep_for = max(args.interval_seconds, 1)
-        time.sleep(sleep_for)
+        time.sleep(max(args.interval_seconds, 1))
 
         append_jsonl(
             log_path,
-            run_once(repo_root, args.reset_script, args.timeout_seconds),
+            run_once(repo_root, args.reset_script, args.timeout_seconds, args.login_host),
         )
 
 

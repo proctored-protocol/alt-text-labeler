@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
+
 
 DEFAULT_ENV_PATH = Path("/srv/alt-text-labeler/.env")
 DEFAULT_BACKUP_JSON_PATH = Path("/tmp/labeler-service-backup.json")
@@ -62,7 +64,10 @@ def http_json(
     body: dict[str, Any] | None = None,
     timeout: int = 30,
 ) -> tuple[int, dict[str, str], Any]:
-    req_headers = {"Accept": "application/json"}
+    req_headers = {
+        "Accept": "application/json",
+        "User-Agent": "alt-text-labeler-record-refresh/3",
+    }
     if headers:
         req_headers.update(headers)
 
@@ -87,8 +92,8 @@ def http_json(
         raise HTTPJSONError(exc.code, raw, payload=parsed) from exc
 
 
-def create_session(pds_url: str, handle: str, app_password: str, timeout: int) -> dict[str, Any]:
-    url = f"{pds_url.rstrip('/')}/xrpc/com.atproto.server.createSession"
+def create_session(host_url: str, handle: str, app_password: str, timeout: int) -> dict[str, Any]:
+    url = f"{host_url.rstrip('/')}/xrpc/com.atproto.server.createSession"
     _status, _headers, payload = http_json(
         url,
         method="POST",
@@ -122,6 +127,46 @@ def put_record(
     return payload
 
 
+def resolve_did_document(did: str, timeout: int) -> dict[str, Any]:
+    if did.startswith("did:plc:"):
+        url = f"https://plc.directory/{quote(did, safe=':')}"
+        _status, _headers, payload = http_json(url, timeout=timeout)
+        if not isinstance(payload, dict):
+            fail("Resolved PLC DID document is not JSON object", details={"did": did, "url": url})
+        return payload
+
+    if did.startswith("did:web:"):
+        host = did[len("did:web:"):]
+        host = host.replace("%3A", ":").replace("%3a", ":")
+        url = f"https://{host}/.well-known/did.json"
+        _status, _headers, payload = http_json(url, timeout=timeout)
+        if not isinstance(payload, dict):
+            fail("Resolved did:web document is not JSON object", details={"did": did, "url": url})
+        return payload
+
+    fail("Unsupported DID method for PDS resolution", details={"did": did})
+    raise AssertionError("unreachable")
+
+
+def extract_pds_url_from_did_doc(did_doc: dict[str, Any], did: str) -> str:
+    services = did_doc.get("service")
+    if not isinstance(services, list):
+        fail("DID document missing service array", details={"did": did})
+
+    for svc in services:
+        if not isinstance(svc, dict):
+            continue
+        svc_id = str(svc.get("id") or "")
+        svc_type = str(svc.get("type") or "")
+        endpoint = str(svc.get("serviceEndpoint") or "").strip()
+
+        if svc_id.endswith("#atproto_pds") and svc_type == "AtprotoPersonalDataServer" and endpoint:
+            return endpoint.rstrip("/")
+
+    fail("Could not find #atproto_pds service endpoint in DID document", details={"did": did})
+    raise AssertionError("unreachable")
+
+
 def load_backup_record(path: Path) -> dict[str, Any]:
     if not path.exists():
         fail("Backup labeler service JSON not found", details={"path": str(path)})
@@ -138,13 +183,17 @@ def load_backup_record(path: Path) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reset labeler service record by authenticated putRecord overwrite."
+        description="Reset labeler service record by resolving the account DID to its real PDS and calling putRecord there."
     )
     parser.add_argument("--env-path", default=str(DEFAULT_ENV_PATH))
     parser.add_argument("--backup-json-path", default=str(DEFAULT_BACKUP_JSON_PATH))
     parser.add_argument("--handle", default=None)
     parser.add_argument("--app-password", default=None)
-    parser.add_argument("--pds-url", default=None)
+    parser.add_argument(
+        "--login-host",
+        default=None,
+        help="Host used only for initial createSession to learn the DID. Defaults to BSKY_PDS_URL or https://bsky.social",
+    )
     parser.add_argument("--timeout-seconds", type=int, default=30)
     return parser.parse_args()
 
@@ -159,7 +208,7 @@ def main() -> None:
 
     handle = (args.handle or env.get("BSKY_HANDLE") or "").strip()
     app_password = (args.app_password or env.get("BSKY_APP_PASSWORD") or "").strip()
-    pds_url = (args.pds_url or env.get("BSKY_PDS_URL") or "https://bsky.social").strip()
+    login_host = (args.login_host or env.get("BSKY_PDS_URL") or "https://bsky.social").strip()
     timeout_seconds = int(args.timeout_seconds)
 
     if not handle:
@@ -168,40 +217,68 @@ def main() -> None:
         fail("Missing required app password", details={"source": "CLI or BSKY_APP_PASSWORD"})
 
     try:
-        session = create_session(pds_url, handle, app_password, timeout_seconds)
+        bootstrap_session = create_session(login_host, handle, app_password, timeout_seconds)
     except HTTPJSONError as exc:
         fail(
-            "Could not create session for labeler account",
-            details={"status_code": exc.status_code, "response": exc.raw_text},
+            "Could not create bootstrap session for labeler account",
+            details={"status_code": exc.status_code, "response": exc.raw_text, "login_host": login_host},
         )
 
-    repo = session.get("did")
-    access_jwt = session.get("accessJwt")
-
-    if not repo or not access_jwt:
+    repo = str(bootstrap_session.get("did") or "").strip()
+    if not repo:
         fail(
-            "Session response missing did or accessJwt",
-            details={"session_keys": sorted(session.keys()) if isinstance(session, dict) else None},
+            "Bootstrap session response missing did",
+            details={"session_keys": sorted(bootstrap_session.keys()) if isinstance(bootstrap_session, dict) else None},
+        )
+
+    try:
+        did_doc = resolve_did_document(repo, timeout_seconds)
+        resolved_pds_url = extract_pds_url_from_did_doc(did_doc, repo)
+    except HTTPJSONError as exc:
+        fail(
+            "Could not resolve DID document for labeler account",
+            details={"status_code": exc.status_code, "response": exc.raw_text, "repo": repo},
+        )
+
+    try:
+        pds_session = create_session(resolved_pds_url, handle, app_password, timeout_seconds)
+    except HTTPJSONError as exc:
+        fail(
+            "Could not create session on resolved PDS",
+            details={
+                "status_code": exc.status_code,
+                "response": exc.raw_text,
+                "repo": repo,
+                "resolved_pds_url": resolved_pds_url,
+            },
+        )
+
+    access_jwt = pds_session.get("accessJwt")
+    if not access_jwt:
+        fail(
+            "Resolved PDS session response missing accessJwt",
+            details={"session_keys": sorted(pds_session.keys()) if isinstance(pds_session, dict) else None},
         )
 
     record = load_backup_record(backup_json_path)
 
     try:
         put_payload = put_record(
-            pds_url=pds_url,
+            pds_url=resolved_pds_url,
             access_jwt=str(access_jwt),
-            repo=str(repo),
+            repo=repo,
             record=record,
             timeout=timeout_seconds,
         )
     except HTTPJSONError as exc:
         fail(
-            "Could not overwrite labeler service record via putRecord",
+            "Could not overwrite labeler service record via putRecord on resolved PDS",
             details={
                 "status_code": exc.status_code,
                 "response": exc.raw_text,
                 "repo": repo,
-                "pds_url": pds_url,
+                "login_host": login_host,
+                "resolved_pds_url": resolved_pds_url,
             },
         )
 
@@ -210,9 +287,11 @@ def main() -> None:
             {
                 "event": "labeler_record_reset_complete",
                 "checked_at": now_iso(),
-                "mode": "put_only",
+                "mode": "put_only_via_resolved_pds",
                 "repo": repo,
-                "handle": session.get("handle"),
+                "handle": pds_session.get("handle") or bootstrap_session.get("handle"),
+                "login_host": login_host,
+                "resolved_pds_url": resolved_pds_url,
                 "new_cid": put_payload.get("cid"),
                 "uri": put_payload.get("uri"),
                 "validationStatus": put_payload.get("validationStatus"),
