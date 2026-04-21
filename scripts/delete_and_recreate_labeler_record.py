@@ -10,6 +10,7 @@ from app.labeler_record_refresh.client import LabelerRecordRefreshClient, Labele
 
 DEFAULT_ENV_PATH = Path("/srv/alt-text-labeler/.env")
 DEFAULT_BACKUP_JSON_PATH = Path("/tmp/labeler-service-backup.json")
+DEFAULT_CACHE_PATH = Path("/srv/alt-text-labeler/metrics/labeler_record_refresh_session.json")
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -26,20 +27,6 @@ def load_env(path: Path) -> dict[str, str]:
     return data
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Refresh labeler service record once, using resolved PDS and cached-style client logic."
-    )
-    parser.add_argument("--env-path", default=str(DEFAULT_ENV_PATH))
-    parser.add_argument("--backup-json-path", default=str(DEFAULT_BACKUP_JSON_PATH))
-    parser.add_argument("--handle", default=None)
-    parser.add_argument("--app-password", default=None)
-    parser.add_argument("--login-host", default=None)
-    parser.add_argument("--timeout-seconds", type=int, default=30)
-    parser.add_argument("--session-refresh-margin-seconds", type=int, default=60)
-    return parser.parse_args()
-
-
 def fail(msg: str, *, details: dict | None = None) -> None:
     payload = {
         "event": "labeler_record_reset_failed",
@@ -48,6 +35,22 @@ def fail(msg: str, *, details: dict | None = None) -> None:
     }
     print(json.dumps(payload, ensure_ascii=False), flush=True)
     raise SystemExit(1)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Refresh labeler service record once, using cached resolved-PDS session logic."
+    )
+    parser.add_argument("--env-path", default=str(DEFAULT_ENV_PATH))
+    parser.add_argument("--backup-json-path", default=str(DEFAULT_BACKUP_JSON_PATH))
+    parser.add_argument("--cache-path", default=str(DEFAULT_CACHE_PATH))
+    parser.add_argument("--handle", default=None)
+    parser.add_argument("--app-password", default=None)
+    parser.add_argument("--login-host", default=None)
+    parser.add_argument("--timeout-seconds", type=int, default=30)
+    parser.add_argument("--access-refresh-margin-seconds", type=int, default=60)
+    parser.add_argument("--refresh-refresh-margin-seconds", type=int, default=300)
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -67,9 +70,11 @@ def main() -> None:
         handle=handle,
         app_password=app_password,
         backup_json_path=args.backup_json_path,
+        cache_path=args.cache_path,
         login_host=login_host,
         timeout_seconds=args.timeout_seconds,
-        session_refresh_margin_seconds=args.session_refresh_margin_seconds,
+        access_refresh_margin_seconds=args.access_refresh_margin_seconds,
+        refresh_refresh_margin_seconds=args.refresh_refresh_margin_seconds,
     )
 
     try:
@@ -93,11 +98,12 @@ def main() -> None:
         json.dumps(
             {
                 "event": "labeler_record_reset_complete",
-                "mode": "put_only_via_resolved_pds_cached_client",
+                "mode": "put_only_via_resolved_pds_persistent_cache",
                 "repo": state["repo_did"],
                 "handle": state["session_handle"] or handle,
                 "login_host": state["login_host"],
                 "resolved_pds_url": state["resolved_pds_url"],
+                "cache_path": state["cache_path"],
                 "new_cid": put_payload.get("cid"),
                 "uri": put_payload.get("uri"),
                 "validationStatus": put_payload.get("validationStatus"),

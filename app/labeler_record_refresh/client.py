@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -61,26 +62,90 @@ class LabelerRecordRefreshClient:
         handle: str,
         app_password: str,
         backup_json_path: str | Path,
+        cache_path: str | Path,
         login_host: str = "https://bsky.social",
         timeout_seconds: int = 30,
-        session_refresh_margin_seconds: int = 60,
-        user_agent: str = "alt-text-labeler-record-refresh/4",
+        access_refresh_margin_seconds: int = 60,
+        refresh_refresh_margin_seconds: int = 300,
+        user_agent: str = "alt-text-labeler-record-refresh/5",
     ) -> None:
         self.handle = handle.strip()
         self.app_password = app_password.strip()
         self.backup_json_path = Path(backup_json_path)
+        self.cache_path = Path(cache_path)
         self.login_host = login_host.rstrip("/")
         self.timeout_seconds = int(timeout_seconds)
-        self.session_refresh_margin_seconds = int(session_refresh_margin_seconds)
+        self.access_refresh_margin_seconds = int(access_refresh_margin_seconds)
+        self.refresh_refresh_margin_seconds = int(refresh_refresh_margin_seconds)
         self.user_agent = user_agent
 
         self.repo_did: str | None = None
         self.resolved_pds_url: str | None = None
         self._session: CachedSession | None = None
+        self.last_refresh_at_iso: str | None = None
+        self.last_refresh_cid: str | None = None
 
-    # ---------------------------------------------------------------------
+        self._load_cache()
+
+    # ------------------------------------------------------------------
+    # cache helpers
+    # ------------------------------------------------------------------
+
+    def _load_cache(self) -> None:
+        if not self.cache_path.exists():
+            return
+
+        payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        self.repo_did = payload.get("repo_did")
+        self.resolved_pds_url = payload.get("resolved_pds_url")
+        self.last_refresh_at_iso = payload.get("last_refresh_at_iso")
+        self.last_refresh_cid = payload.get("last_refresh_cid")
+
+        access_jwt = payload.get("access_jwt")
+        refresh_jwt = payload.get("refresh_jwt")
+        if access_jwt:
+            self._session = CachedSession(
+                access_jwt=str(access_jwt),
+                refresh_jwt=(str(refresh_jwt) if refresh_jwt else None),
+                access_expires_at_epoch=(
+                    float(payload["access_expires_at_epoch"])
+                    if payload.get("access_expires_at_epoch") is not None
+                    else None
+                ),
+                refresh_expires_at_epoch=(
+                    float(payload["refresh_expires_at_epoch"])
+                    if payload.get("refresh_expires_at_epoch") is not None
+                    else None
+                ),
+                did=payload.get("session_did"),
+                handle=payload.get("session_handle"),
+            )
+
+    def _save_cache(self) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "repo_did": self.repo_did,
+            "resolved_pds_url": self.resolved_pds_url,
+            "last_refresh_at_iso": self.last_refresh_at_iso,
+            "last_refresh_cid": self.last_refresh_cid,
+            "session_did": None if self._session is None else self._session.did,
+            "session_handle": None if self._session is None else self._session.handle,
+            "access_jwt": None if self._session is None else self._session.access_jwt,
+            "refresh_jwt": None if self._session is None else self._session.refresh_jwt,
+            "access_expires_at_epoch": None if self._session is None else self._session.access_expires_at_epoch,
+            "refresh_expires_at_epoch": None if self._session is None else self._session.refresh_expires_at_epoch,
+            "saved_at_iso": now_iso(),
+        }
+
+        tmp_path = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, self.cache_path)
+
+    # ------------------------------------------------------------------
     # low-level http
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _http_json(
         self,
@@ -142,15 +207,15 @@ class LabelerRecordRefreshClient:
                 retryable=True,
             ) from exc
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # jwt/session helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    def _decode_jwt_exp(self, jwt_token: str | None) -> float | None:
-        if not jwt_token:
+    def _decode_jwt_exp(self, token: str | None) -> float | None:
+        if not token:
             return None
         try:
-            parts = jwt_token.split(".")
+            parts = token.split(".")
             if len(parts) != 3:
                 return None
             payload_part = parts[1]
@@ -167,7 +232,14 @@ class LabelerRecordRefreshClient:
             return False
         if self._session.access_expires_at_epoch is None:
             return True
-        return time.time() < (self._session.access_expires_at_epoch - self.session_refresh_margin_seconds)
+        return time.time() < (self._session.access_expires_at_epoch - self.access_refresh_margin_seconds)
+
+    def _refresh_token_fresh(self) -> bool:
+        if self._session is None or not self._session.refresh_jwt:
+            return False
+        if self._session.refresh_expires_at_epoch is None:
+            return True
+        return time.time() < (self._session.refresh_expires_at_epoch - self.refresh_refresh_margin_seconds)
 
     def _create_session(self, host_url: str) -> CachedSession:
         _, _, payload = self._http_json(
@@ -187,7 +259,7 @@ class LabelerRecordRefreshClient:
                 retryable=False,
             )
 
-        return CachedSession(
+        session = CachedSession(
             access_jwt=str(payload["accessJwt"]),
             refresh_jwt=(str(payload["refreshJwt"]) if payload.get("refreshJwt") else None),
             access_expires_at_epoch=self._decode_jwt_exp(payload.get("accessJwt")),
@@ -195,6 +267,11 @@ class LabelerRecordRefreshClient:
             did=(str(payload["did"]) if payload.get("did") else None),
             handle=(str(payload["handle"]) if payload.get("handle") else None),
         )
+        self._session = session
+        if session.did and not self.repo_did:
+            self.repo_did = session.did
+        self._save_cache()
+        return session
 
     def _refresh_session(self) -> CachedSession:
         if self._session is None or not self._session.refresh_jwt:
@@ -226,7 +303,7 @@ class LabelerRecordRefreshClient:
                 retryable=False,
             )
 
-        return CachedSession(
+        session = CachedSession(
             access_jwt=str(payload["accessJwt"]),
             refresh_jwt=(str(payload["refreshJwt"]) if payload.get("refreshJwt") else self._session.refresh_jwt),
             access_expires_at_epoch=self._decode_jwt_exp(payload.get("accessJwt")),
@@ -234,10 +311,15 @@ class LabelerRecordRefreshClient:
             did=(str(payload["did"]) if payload.get("did") else self._session.did),
             handle=(str(payload["handle"]) if payload.get("handle") else self._session.handle),
         )
+        self._session = session
+        if session.did and not self.repo_did:
+            self.repo_did = session.did
+        self._save_cache()
+        return session
 
-    # ---------------------------------------------------------------------
-    # did / pds resolution
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # DID/PDS resolution
+    # ------------------------------------------------------------------
 
     def _resolve_did_document(self, did: str) -> dict[str, Any]:
         if did.startswith("did:plc:"):
@@ -289,10 +371,12 @@ class LabelerRecordRefreshClient:
             retryable=False,
         )
 
-    def _bootstrap_resolution(self) -> None:
+    def ensure_resolution(self) -> None:
+        if self.repo_did and self.resolved_pds_url:
+            return
+
         bootstrap_session = self._create_session(self.login_host)
-        repo_did = bootstrap_session.did
-        if not repo_did:
+        if not bootstrap_session.did:
             raise LabelerRefreshError(
                 http_status=200,
                 error_code="bootstrap_session_missing_did",
@@ -300,52 +384,58 @@ class LabelerRecordRefreshClient:
                 retryable=False,
             )
 
-        did_doc = self._resolve_did_document(repo_did)
-        resolved_pds_url = self._extract_pds_url(did_doc)
+        self.repo_did = bootstrap_session.did
+        did_doc = self._resolve_did_document(self.repo_did)
+        self.resolved_pds_url = self._extract_pds_url(did_doc)
+        self._save_cache()
 
-        self.repo_did = repo_did
-        self.resolved_pds_url = resolved_pds_url
+        if self.resolved_pds_url == self.login_host:
+            return
 
-        if resolved_pds_url == self.login_host:
-            self._session = bootstrap_session
-        else:
-            self._session = self._create_session(resolved_pds_url)
+        # If the bootstrap host is not the real PDS, throw away the bootstrap session.
+        self._session = None
+        self._save_cache()
 
-    # ---------------------------------------------------------------------
-    # public state/session methods
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # public session management
+    # ------------------------------------------------------------------
 
     def ensure_session(self) -> str:
-        if self._session is None or self.resolved_pds_url is None or self.repo_did is None:
-            self._bootstrap_resolution()
+        self.ensure_resolution()
+
+        if self._access_token_fresh():
             assert self._session is not None
             return self._session.access_jwt
 
-        if self._access_token_fresh():
-            return self._session.access_jwt
+        if self._refresh_token_fresh():
+            try:
+                session = self._refresh_session()
+                return session.access_jwt
+            except LabelerRefreshError as exc:
+                if exc.http_status != 401:
+                    raise
 
-        try:
-            self._session = self._refresh_session()
-            return self._session.access_jwt
-        except LabelerRefreshError as exc:
-            if exc.http_status == 401:
-                self._session = self._create_session(self.resolved_pds_url)
-                return self._session.access_jwt
-            raise
+        assert self.resolved_pds_url is not None
+        session = self._create_session(self.resolved_pds_url)
+        return session.access_jwt
 
     def state_dict(self) -> dict[str, Any]:
         return {
             "repo_did": self.repo_did,
             "resolved_pds_url": self.resolved_pds_url,
             "login_host": self.login_host,
+            "cache_path": str(self.cache_path),
+            "cache_exists": self.cache_path.exists(),
             "session_handle": None if self._session is None else self._session.handle,
             "access_token_expires_at_epoch": None if self._session is None else self._session.access_expires_at_epoch,
             "refresh_token_expires_at_epoch": None if self._session is None else self._session.refresh_expires_at_epoch,
+            "last_refresh_at_iso": self.last_refresh_at_iso,
+            "last_refresh_cid": self.last_refresh_cid,
         }
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # record helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def load_backup_record(self) -> dict[str, Any]:
         if not self.backup_json_path.exists():
@@ -380,11 +470,11 @@ class LabelerRecordRefreshClient:
                 retryable=False,
             )
 
-        try:
+        def _do_put(token: str) -> dict[str, Any]:
             _, _, payload = self._http_json(
                 f"{self.resolved_pds_url.rstrip('/')}/xrpc/com.atproto.repo.putRecord",
                 method="POST",
-                headers={"Authorization": f"Bearer {access_jwt}"},
+                headers={"Authorization": f"Bearer {token}"},
                 body={
                     "repo": self.repo_did,
                     "collection": RECORD_COLLECTION,
@@ -393,34 +483,28 @@ class LabelerRecordRefreshClient:
                     "validate": True,
                 },
             )
-        except LabelerRefreshError as exc:
-            if exc.http_status == 401:
-                self._session = self._create_session(self.resolved_pds_url)
-                _, _, payload = self._http_json(
-                    f"{self.resolved_pds_url.rstrip('/')}/xrpc/com.atproto.repo.putRecord",
-                    method="POST",
-                    headers={"Authorization": f"Bearer {self._session.access_jwt}"},
-                    body={
-                        "repo": self.repo_did,
-                        "collection": RECORD_COLLECTION,
-                        "rkey": RECORD_RKEY,
-                        "record": record,
-                        "validate": True,
-                    },
+            if not isinstance(payload, dict):
+                raise LabelerRefreshError(
+                    http_status=200,
+                    error_code="invalid_put_record_response",
+                    error_text="putRecord did not return a JSON object",
+                    response_json=payload if isinstance(payload, dict) else None,
+                    retryable=False,
                 )
-            else:
-                raise
+            return payload
 
-        if not isinstance(payload, dict):
-            raise LabelerRefreshError(
-                http_status=200,
-                error_code="invalid_put_record_response",
-                error_text="putRecord did not return a JSON object",
-                response_json=payload if isinstance(payload, dict) else None,
-                retryable=False,
-            )
-        return payload
+        try:
+            return _do_put(access_jwt)
+        except LabelerRefreshError as exc:
+            if exc.http_status != 401:
+                raise
+            access_jwt = self.ensure_session()
+            return _do_put(access_jwt)
 
     def refresh_from_backup(self) -> dict[str, Any]:
         record = self.load_backup_record()
-        return self.put_record(record)
+        payload = self.put_record(record)
+        self.last_refresh_at_iso = now_iso()
+        self.last_refresh_cid = str(payload.get("cid") or "") or None
+        self._save_cache()
+        return payload
