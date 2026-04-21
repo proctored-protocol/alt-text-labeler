@@ -3,14 +3,40 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy import text
+
+from app.labeler_record_refresh.client import LabelerRecordRefreshClient, LabelerRefreshError
+from app.db import get_engine
+
+
+DEFAULT_ENV_PATH = Path("/srv/alt-text-labeler/.env")
+DEFAULT_BACKUP_JSON_PATH = Path("/tmp/labeler-service-backup.json")
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return now_utc().isoformat().replace("+00:00", "Z")
+
+
+def load_env(path: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if not path.exists():
+        return data
+
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip()] = value.strip()
+    return data
 
 
 def default_log_path(metrics_dir: Path) -> Path:
@@ -18,138 +44,239 @@ def default_log_path(metrics_dir: Path) -> Path:
     return metrics_dir / f"labeler_record_refresh_{stamp}.jsonl"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run labeler service record refresh on a fixed time interval."
-    )
-    parser.add_argument(
-        "--interval-seconds",
-        type=int,
-        default=int(os.environ.get("REFRESH_INTERVAL_SECONDS", "300")),
-        help="Seconds between refresh attempts. Default: 300.",
-    )
-    parser.add_argument(
-        "--reset-script",
-        default=os.environ.get(
-            "RESET_SCRIPT",
-            "scripts/delete_and_recreate_labeler_record.py",
-        ),
-        help="Path to the reset script.",
-    )
-    parser.add_argument(
-        "--timeout-seconds",
-        type=int,
-        default=int(os.environ.get("RESET_TIMEOUT_SECONDS", "180")),
-        help="Subprocess timeout for one reset attempt.",
-    )
-    parser.add_argument(
-        "--metrics-dir",
-        default=os.environ.get("METRICS_DIR", "metrics"),
-        help="Directory for JSONL logs.",
-    )
-    parser.add_argument(
-        "--startup-reset",
-        action="store_true",
-        help="Perform one reset immediately on startup.",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run exactly one reset attempt and exit.",
-    )
-    parser.add_argument(
-        "--login-host",
-        default=os.environ.get("RESET_LOGIN_HOST", ""),
-        help="Optional login host passed through to the reset script.",
-    )
-    return parser.parse_args()
-
-
-def run_once(repo_root: Path, reset_script: str, timeout_seconds: int, login_host: str) -> dict:
-    started_at = now_iso()
-    cmd = ["python", reset_script]
-    if login_host.strip():
-        cmd.extend(["--login-host", login_host.strip()])
-
-    proc = subprocess.run(
-        cmd,
-        cwd=str(repo_root),
-        text=True,
-        capture_output=True,
-        timeout=timeout_seconds,
-    )
-
-    payload = {
-        "event": "labeler_record_refresh_attempt",
-        "started_at": started_at,
-        "finished_at": now_iso(),
-        "reset_script": reset_script,
-        "login_host": login_host.strip() or None,
-        "returncode": proc.returncode,
-        "stdout_tail": proc.stdout[-4000:],
-        "stderr_tail": proc.stderr[-4000:],
-        "success": proc.returncode == 0,
-    }
-    return payload
-
-
 def append_jsonl(path: Path, payload: dict) -> None:
-    line = json.dumps(payload, ensure_ascii=False)
+    line = json.dumps(payload, ensure_ascii=False, default=str)
     print(line, flush=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
+def get_emit_counts_since(since_utc: datetime) -> dict[str, int]:
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT
+                    COALESCE((
+                        SELECT COUNT(*)
+                        FROM publish_attempt
+                        WHERE result_status = 'published'
+                          AND finished_at > :since_utc
+                    ), 0) AS publish_emits,
+                    COALESCE((
+                        SELECT COUNT(*)
+                        FROM visibility_remediation
+                        WHERE first_relabel_event_id IS NOT NULL
+                          AND first_attempt_at > :since_utc
+                    ), 0) AS remediation_first_relabels,
+                    COALESCE((
+                        SELECT COUNT(*)
+                        FROM visibility_remediation
+                        WHERE second_relabel_event_id IS NOT NULL
+                          AND second_attempt_at > :since_utc
+                    ), 0) AS remediation_second_relabels
+            """),
+            {"since_utc": since_utc},
+        ).mappings().one()
+
+    publish_emits = int(row["publish_emits"] or 0)
+    remediation_first = int(row["remediation_first_relabels"] or 0)
+    remediation_second = int(row["remediation_second_relabels"] or 0)
+
+    return {
+        "publish_emits": publish_emits,
+        "remediation_first_relabels": remediation_first,
+        "remediation_second_relabels": remediation_second,
+        "total_emits": publish_emits + remediation_first + remediation_second,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Long-lived labeler record refresh daemon with cached session and emit/time triggers."
+    )
+    parser.add_argument("--env-path", default=str(DEFAULT_ENV_PATH))
+    parser.add_argument("--backup-json-path", default=str(DEFAULT_BACKUP_JSON_PATH))
+    parser.add_argument("--handle", default=None)
+    parser.add_argument("--app-password", default=None)
+    parser.add_argument("--login-host", default=None)
+
+    parser.add_argument(
+        "--max-interval-seconds",
+        type=int,
+        default=int(os.environ.get("REFRESH_MAX_INTERVAL_SECONDS", "300")),
+    )
+    parser.add_argument(
+        "--min-interval-seconds",
+        type=int,
+        default=int(os.environ.get("REFRESH_MIN_INTERVAL_SECONDS", "60")),
+    )
+    parser.add_argument(
+        "--emit-threshold",
+        type=int,
+        default=int(os.environ.get("REFRESH_EMIT_THRESHOLD", "250")),
+    )
+    parser.add_argument(
+        "--check-poll-seconds",
+        type=int,
+        default=int(os.environ.get("REFRESH_CHECK_POLL_SECONDS", "5")),
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=int(os.environ.get("RESET_TIMEOUT_SECONDS", "30")),
+    )
+    parser.add_argument(
+        "--session-refresh-margin-seconds",
+        type=int,
+        default=int(os.environ.get("REFRESH_SESSION_MARGIN_SECONDS", "60")),
+    )
+    parser.add_argument(
+        "--metrics-dir",
+        default=os.environ.get("METRICS_DIR", "metrics"),
+    )
+    parser.add_argument(
+        "--startup-refresh",
+        action="store_true",
+        help="Perform one refresh immediately at startup.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Evaluate triggers once, perform one refresh, and exit.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     args = parse_args()
+    env = load_env(Path(args.env_path))
 
-    repo_root = Path.cwd()
+    handle = (args.handle or env.get("BSKY_HANDLE") or "").strip()
+    app_password = (args.app_password or env.get("BSKY_APP_PASSWORD") or "").strip()
+    login_host = (args.login_host or env.get("BSKY_PDS_URL") or "https://bsky.social").strip()
+
+    if not handle:
+        raise SystemExit("Missing handle (CLI or BSKY_HANDLE)")
+    if not app_password:
+        raise SystemExit("Missing app password (CLI or BSKY_APP_PASSWORD)")
+
     metrics_dir = Path(args.metrics_dir)
     metrics_dir.mkdir(parents=True, exist_ok=True)
     log_path = default_log_path(metrics_dir)
 
+    client = LabelerRecordRefreshClient(
+        handle=handle,
+        app_password=app_password,
+        backup_json_path=args.backup_json_path,
+        login_host=login_host,
+        timeout_seconds=args.timeout_seconds,
+        session_refresh_margin_seconds=args.session_refresh_margin_seconds,
+    )
+
+    started_at = now_utc()
+    last_success_at = started_at
+    last_attempt_at: datetime | None = None
+
     startup = {
-        "event": "labeler_record_refresh_runner_started",
-        "started_at": now_iso(),
-        "interval_seconds": args.interval_seconds,
-        "reset_script": args.reset_script,
+        "event": "labeler_record_refresh_daemon_started",
+        "started_at": started_at.isoformat().replace("+00:00", "Z"),
+        "handle": handle,
+        "login_host": login_host,
+        "max_interval_seconds": args.max_interval_seconds,
+        "min_interval_seconds": args.min_interval_seconds,
+        "emit_threshold": args.emit_threshold,
+        "check_poll_seconds": args.check_poll_seconds,
         "timeout_seconds": args.timeout_seconds,
-        "startup_reset": bool(args.startup_reset),
+        "session_refresh_margin_seconds": args.session_refresh_margin_seconds,
+        "startup_refresh": bool(args.startup_refresh),
         "once": bool(args.once),
-        "login_host": args.login_host.strip() or None,
         "log_path": str(log_path),
     }
     append_jsonl(log_path, startup)
 
+    def do_refresh(reason: str, emit_counts: dict[str, int]) -> None:
+        nonlocal last_success_at, last_attempt_at
+
+        started = now_utc()
+        try:
+            put_payload = client.refresh_from_backup()
+            finished = now_utc()
+            state = client.state_dict()
+
+            payload = {
+                "event": "labeler_record_refresh_attempt",
+                "started_at": started.isoformat().replace("+00:00", "Z"),
+                "finished_at": finished.isoformat().replace("+00:00", "Z"),
+                "reason": reason,
+                "emit_counts_since_last_success": emit_counts,
+                "success": True,
+                "repo": state["repo_did"],
+                "resolved_pds_url": state["resolved_pds_url"],
+                "new_cid": put_payload.get("cid"),
+                "uri": put_payload.get("uri"),
+                "validationStatus": put_payload.get("validationStatus"),
+            }
+            append_jsonl(log_path, payload)
+            last_success_at = finished
+            last_attempt_at = finished
+        except LabelerRefreshError as exc:
+            finished = now_utc()
+            payload = {
+                "event": "labeler_record_refresh_attempt",
+                "started_at": started.isoformat().replace("+00:00", "Z"),
+                "finished_at": finished.isoformat().replace("+00:00", "Z"),
+                "reason": reason,
+                "emit_counts_since_last_success": emit_counts,
+                "success": False,
+                "http_status": exc.http_status,
+                "error_code": exc.error_code,
+                "error_text": exc.error_text,
+                "response_json": exc.response_json,
+                "raw_text": exc.raw_text,
+                **client.state_dict(),
+            }
+            append_jsonl(log_path, payload)
+            last_attempt_at = finished
+
+    if args.startup_refresh:
+        do_refresh("startup_refresh", {"publish_emits": 0, "remediation_first_relabels": 0, "remediation_second_relabels": 0, "total_emits": 0})
+        if args.once:
+            return
+
     if args.once:
-        append_jsonl(
-            log_path,
-            run_once(repo_root, args.reset_script, args.timeout_seconds, args.login_host),
-        )
+        emit_counts = get_emit_counts_since(last_success_at)
+        do_refresh("once", emit_counts)
         return
 
-    if args.startup_reset:
-        append_jsonl(
-            log_path,
-            run_once(repo_root, args.reset_script, args.timeout_seconds, args.login_host),
-        )
-
     while True:
-        next_run_at = time.time() + args.interval_seconds
+        current = now_utc()
+        emit_counts = get_emit_counts_since(last_success_at)
+
+        seconds_since_success = (current - last_success_at).total_seconds()
+        seconds_since_attempt = None if last_attempt_at is None else (current - last_attempt_at).total_seconds()
+
+        eligible_by_threshold = emit_counts["total_emits"] >= args.emit_threshold
+        eligible_by_time = seconds_since_success >= args.max_interval_seconds
+        blocked_by_floor = seconds_since_attempt is not None and seconds_since_attempt < args.min_interval_seconds
+
         heartbeat = {
-            "event": "labeler_record_refresh_waiting",
-            "checked_at": now_iso(),
-            "next_run_at_utc": datetime.fromtimestamp(next_run_at, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
-            "interval_seconds": args.interval_seconds,
+            "event": "labeler_record_refresh_tick",
+            "checked_at": current.isoformat().replace("+00:00", "Z"),
+            "seconds_since_last_success": round(seconds_since_success, 3),
+            "seconds_since_last_attempt": None if seconds_since_attempt is None else round(seconds_since_attempt, 3),
+            "emit_counts_since_last_success": emit_counts,
+            "eligible_by_threshold": eligible_by_threshold,
+            "eligible_by_time": eligible_by_time,
+            "blocked_by_min_interval": blocked_by_floor,
+            "next_poll_in_seconds": args.check_poll_seconds,
         }
         append_jsonl(log_path, heartbeat)
 
-        time.sleep(max(args.interval_seconds, 1))
+        if (eligible_by_threshold or eligible_by_time) and not blocked_by_floor:
+            reason = "emit_threshold" if eligible_by_threshold else "max_interval"
+            do_refresh(reason, emit_counts)
 
-        append_jsonl(
-            log_path,
-            run_once(repo_root, args.reset_script, args.timeout_seconds, args.login_host),
-        )
+        time.sleep(max(args.check_poll_seconds, 1))
 
 
 if __name__ == "__main__":

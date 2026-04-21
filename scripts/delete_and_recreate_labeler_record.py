@@ -3,31 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from urllib.error import HTTPError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+
+from app.labeler_record_refresh.client import LabelerRecordRefreshClient, LabelerRefreshError
 
 
 DEFAULT_ENV_PATH = Path("/srv/alt-text-labeler/.env")
 DEFAULT_BACKUP_JSON_PATH = Path("/tmp/labeler-service-backup.json")
-
-RECORD_COLLECTION = "app.bsky.labeler.service"
-RECORD_RKEY = "self"
-
-
-class HTTPJSONError(RuntimeError):
-    def __init__(self, status_code: int, raw_text: str, payload: Any | None = None) -> None:
-        super().__init__(f"HTTP {status_code}: {raw_text}")
-        self.status_code = status_code
-        self.raw_text = raw_text
-        self.payload = payload
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -44,254 +26,78 @@ def load_env(path: Path) -> dict[str, str]:
     return data
 
 
-def fail(msg: str, *, details: dict[str, Any] | None = None) -> None:
-    payload: dict[str, Any] = {
-        "event": "labeler_record_reset_failed",
-        "checked_at": now_iso(),
-        "message": msg,
-    }
-    if details:
-        payload["details"] = details
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
-    raise SystemExit(1)
-
-
-def http_json(
-    url: str,
-    *,
-    method: str = "GET",
-    headers: dict[str, str] | None = None,
-    body: dict[str, Any] | None = None,
-    timeout: int = 30,
-) -> tuple[int, dict[str, str], Any]:
-    req_headers = {
-        "Accept": "application/json",
-        "User-Agent": "alt-text-labeler-record-refresh/3",
-    }
-    if headers:
-        req_headers.update(headers)
-
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        req_headers["Content-Type"] = "application/json"
-
-    req = Request(url, data=data, headers=req_headers, method=method)
-
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            parsed = json.loads(raw) if raw else {}
-            return resp.status, dict(resp.headers.items()), parsed
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            parsed = None
-        raise HTTPJSONError(exc.code, raw, payload=parsed) from exc
-
-
-def create_session(host_url: str, handle: str, app_password: str, timeout: int) -> dict[str, Any]:
-    url = f"{host_url.rstrip('/')}/xrpc/com.atproto.server.createSession"
-    _status, _headers, payload = http_json(
-        url,
-        method="POST",
-        body={"identifier": handle, "password": app_password},
-        timeout=timeout,
-    )
-    return payload
-
-
-def put_record(
-    pds_url: str,
-    access_jwt: str,
-    repo: str,
-    record: dict[str, Any],
-    timeout: int,
-) -> dict[str, Any]:
-    url = f"{pds_url.rstrip('/')}/xrpc/com.atproto.repo.putRecord"
-    _status, _headers, payload = http_json(
-        url,
-        method="POST",
-        headers={"Authorization": f"Bearer {access_jwt}"},
-        body={
-            "repo": repo,
-            "collection": RECORD_COLLECTION,
-            "rkey": RECORD_RKEY,
-            "record": record,
-            "validate": True,
-        },
-        timeout=timeout,
-    )
-    return payload
-
-
-def resolve_did_document(did: str, timeout: int) -> dict[str, Any]:
-    if did.startswith("did:plc:"):
-        url = f"https://plc.directory/{quote(did, safe=':')}"
-        _status, _headers, payload = http_json(url, timeout=timeout)
-        if not isinstance(payload, dict):
-            fail("Resolved PLC DID document is not JSON object", details={"did": did, "url": url})
-        return payload
-
-    if did.startswith("did:web:"):
-        host = did[len("did:web:"):]
-        host = host.replace("%3A", ":").replace("%3a", ":")
-        url = f"https://{host}/.well-known/did.json"
-        _status, _headers, payload = http_json(url, timeout=timeout)
-        if not isinstance(payload, dict):
-            fail("Resolved did:web document is not JSON object", details={"did": did, "url": url})
-        return payload
-
-    fail("Unsupported DID method for PDS resolution", details={"did": did})
-    raise AssertionError("unreachable")
-
-
-def extract_pds_url_from_did_doc(did_doc: dict[str, Any], did: str) -> str:
-    services = did_doc.get("service")
-    if not isinstance(services, list):
-        fail("DID document missing service array", details={"did": did})
-
-    for svc in services:
-        if not isinstance(svc, dict):
-            continue
-        svc_id = str(svc.get("id") or "")
-        svc_type = str(svc.get("type") or "")
-        endpoint = str(svc.get("serviceEndpoint") or "").strip()
-
-        if svc_id.endswith("#atproto_pds") and svc_type == "AtprotoPersonalDataServer" and endpoint:
-            return endpoint.rstrip("/")
-
-    fail("Could not find #atproto_pds service endpoint in DID document", details={"did": did})
-    raise AssertionError("unreachable")
-
-
-def load_backup_record(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        fail("Backup labeler service JSON not found", details={"path": str(path)})
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    value = payload.get("value")
-    if not isinstance(value, dict):
-        fail("Backup JSON does not contain a usable value object", details={"path": str(path)})
-
-    record = json.loads(json.dumps(value))
-    record["createdAt"] = now_iso()
-    return record
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reset labeler service record by resolving the account DID to its real PDS and calling putRecord there."
+        description="Refresh labeler service record once, using resolved PDS and cached-style client logic."
     )
     parser.add_argument("--env-path", default=str(DEFAULT_ENV_PATH))
     parser.add_argument("--backup-json-path", default=str(DEFAULT_BACKUP_JSON_PATH))
     parser.add_argument("--handle", default=None)
     parser.add_argument("--app-password", default=None)
-    parser.add_argument(
-        "--login-host",
-        default=None,
-        help="Host used only for initial createSession to learn the DID. Defaults to BSKY_PDS_URL or https://bsky.social",
-    )
+    parser.add_argument("--login-host", default=None)
     parser.add_argument("--timeout-seconds", type=int, default=30)
+    parser.add_argument("--session-refresh-margin-seconds", type=int, default=60)
     return parser.parse_args()
+
+
+def fail(msg: str, *, details: dict | None = None) -> None:
+    payload = {
+        "event": "labeler_record_reset_failed",
+        "message": msg,
+        "details": details or {},
+    }
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+    raise SystemExit(1)
 
 
 def main() -> None:
     args = parse_args()
-
-    env_path = Path(args.env_path)
-    backup_json_path = Path(args.backup_json_path)
-
-    env = load_env(env_path)
+    env = load_env(Path(args.env_path))
 
     handle = (args.handle or env.get("BSKY_HANDLE") or "").strip()
     app_password = (args.app_password or env.get("BSKY_APP_PASSWORD") or "").strip()
     login_host = (args.login_host or env.get("BSKY_PDS_URL") or "https://bsky.social").strip()
-    timeout_seconds = int(args.timeout_seconds)
 
     if not handle:
         fail("Missing required handle", details={"source": "CLI or BSKY_HANDLE"})
     if not app_password:
         fail("Missing required app password", details={"source": "CLI or BSKY_APP_PASSWORD"})
 
-    try:
-        bootstrap_session = create_session(login_host, handle, app_password, timeout_seconds)
-    except HTTPJSONError as exc:
-        fail(
-            "Could not create bootstrap session for labeler account",
-            details={"status_code": exc.status_code, "response": exc.raw_text, "login_host": login_host},
-        )
-
-    repo = str(bootstrap_session.get("did") or "").strip()
-    if not repo:
-        fail(
-            "Bootstrap session response missing did",
-            details={"session_keys": sorted(bootstrap_session.keys()) if isinstance(bootstrap_session, dict) else None},
-        )
+    client = LabelerRecordRefreshClient(
+        handle=handle,
+        app_password=app_password,
+        backup_json_path=args.backup_json_path,
+        login_host=login_host,
+        timeout_seconds=args.timeout_seconds,
+        session_refresh_margin_seconds=args.session_refresh_margin_seconds,
+    )
 
     try:
-        did_doc = resolve_did_document(repo, timeout_seconds)
-        resolved_pds_url = extract_pds_url_from_did_doc(did_doc, repo)
-    except HTTPJSONError as exc:
+        put_payload = client.refresh_from_backup()
+    except LabelerRefreshError as exc:
         fail(
-            "Could not resolve DID document for labeler account",
-            details={"status_code": exc.status_code, "response": exc.raw_text, "repo": repo},
-        )
-
-    try:
-        pds_session = create_session(resolved_pds_url, handle, app_password, timeout_seconds)
-    except HTTPJSONError as exc:
-        fail(
-            "Could not create session on resolved PDS",
+            "Could not refresh labeler service record",
             details={
-                "status_code": exc.status_code,
-                "response": exc.raw_text,
-                "repo": repo,
-                "resolved_pds_url": resolved_pds_url,
+                "http_status": exc.http_status,
+                "error_code": exc.error_code,
+                "error_text": exc.error_text,
+                "response_json": exc.response_json,
+                "raw_text": exc.raw_text,
+                **client.state_dict(),
             },
         )
 
-    access_jwt = pds_session.get("accessJwt")
-    if not access_jwt:
-        fail(
-            "Resolved PDS session response missing accessJwt",
-            details={"session_keys": sorted(pds_session.keys()) if isinstance(pds_session, dict) else None},
-        )
-
-    record = load_backup_record(backup_json_path)
-
-    try:
-        put_payload = put_record(
-            pds_url=resolved_pds_url,
-            access_jwt=str(access_jwt),
-            repo=repo,
-            record=record,
-            timeout=timeout_seconds,
-        )
-    except HTTPJSONError as exc:
-        fail(
-            "Could not overwrite labeler service record via putRecord on resolved PDS",
-            details={
-                "status_code": exc.status_code,
-                "response": exc.raw_text,
-                "repo": repo,
-                "login_host": login_host,
-                "resolved_pds_url": resolved_pds_url,
-            },
-        )
+    state = client.state_dict()
 
     print(
         json.dumps(
             {
                 "event": "labeler_record_reset_complete",
-                "checked_at": now_iso(),
-                "mode": "put_only_via_resolved_pds",
-                "repo": repo,
-                "handle": pds_session.get("handle") or bootstrap_session.get("handle"),
-                "login_host": login_host,
-                "resolved_pds_url": resolved_pds_url,
+                "mode": "put_only_via_resolved_pds_cached_client",
+                "repo": state["repo_did"],
+                "handle": state["session_handle"] or handle,
+                "login_host": state["login_host"],
+                "resolved_pds_url": state["resolved_pds_url"],
                 "new_cid": put_payload.get("cid"),
                 "uri": put_payload.get("uri"),
                 "validationStatus": put_payload.get("validationStatus"),
