@@ -59,6 +59,7 @@ class VisibilityWorker:
         self.max_attempts = self.settings.visibility_max_attempts
         self.retry_seconds = self.settings.visibility_retry_seconds
         self.max_age_seconds = self.settings.visibility_max_age_seconds
+        self.seed_lookback_seconds = self.settings.visibility_seed_lookback_seconds
         self.initial_delay_seconds = self.settings.visibility_initial_delay_seconds
 
         logger.info(
@@ -69,6 +70,7 @@ class VisibilityWorker:
                 "lease_seconds": self.lease_seconds,
                 "retry_seconds": self.retry_seconds,
                 "max_age_seconds": self.max_age_seconds,
+                "seed_lookback_seconds": self.seed_lookback_seconds,
                 "initial_delay_seconds": self.initial_delay_seconds,
                 "mode": "baseline_5m_forced_hydration",
             },
@@ -103,6 +105,7 @@ class VisibilityWorker:
                     "appview_url": self.settings.verifier_appview_url,
                     "retry_seconds": self.retry_seconds,
                     "max_age_seconds": self.max_age_seconds,
+                    "seed_lookback_seconds": self.seed_lookback_seconds,
                     "initial_delay_seconds": self.initial_delay_seconds,
                 },
             )
@@ -118,6 +121,7 @@ class VisibilityWorker:
                     seed_visibility_checks(
                         session,
                         max_age_seconds=self.max_age_seconds,
+                        seed_lookback_seconds=self.seed_lookback_seconds,
                         initial_delay_seconds=self.initial_delay_seconds,
                         now=now,
                     )

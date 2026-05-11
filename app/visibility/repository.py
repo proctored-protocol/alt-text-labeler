@@ -36,9 +36,24 @@ def seed_visibility_checks(
     *,
     max_age_seconds: int,
     initial_delay_seconds: int,
+    seed_lookback_seconds: int | None = None,
     now: datetime | None = None,
 ) -> int:
     now = now or utc_now()
+    seed_lookback_seconds = int(seed_lookback_seconds or max_age_seconds)
+
+    # Only one visibility worker should perform the global seed pass at a time.
+    # ON CONFLICT DO NOTHING prevents duplicates, but concurrent bulk inserts into
+    # the same unique index can still deadlock under load. Workers that fail to
+    # acquire this transaction-scoped advisory lock simply skip seeding and
+    # continue leasing existing visibility checks.
+    lock_acquired = session.execute(
+        text("SELECT pg_try_advisory_xact_lock(:lock_key)"),
+        {"lock_key": 930041337001},
+    ).scalar_one()
+
+    if not bool(lock_acquired):
+        return 0
 
     result = session.execute(
         text("""
@@ -60,12 +75,12 @@ def seed_visibility_checks(
             FROM publish_job pj
             WHERE pj.status = 'published'
               AND pj.published_at IS NOT NULL
-              AND pj.published_at >= (:now - (:max_age_seconds * INTERVAL '1 second'))
+              AND pj.published_at >= (:now - (:seed_lookback_seconds * INTERVAL '1 second'))
             ON CONFLICT (publish_job_id) DO NOTHING
         """),
         {
             "now": now,
-            "max_age_seconds": max_age_seconds,
+            "seed_lookback_seconds": seed_lookback_seconds,
             "initial_delay_seconds": initial_delay_seconds,
         },
     )
