@@ -16,8 +16,15 @@ from app.publish.repository import (
     lease_publish_batch,
     mark_attempt_started,
     mark_job_published,
+    mark_job_rate_limited,
     mark_job_retry_or_error,
+    release_job_for_local_rate_limit,
     upsert_worker_heartbeat,
+)
+from app.rate_limit.repository import (
+    LabelWriteRateLimitConfig,
+    acquire_label_write_permit,
+    set_label_write_cooldown,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +79,28 @@ class PublishWorker:
         self.backoff_base_seconds = int(
             getattr(self.settings, "publish_backoff_base_seconds", 15)
         )
+        self.rate_limit_scope = str(
+            getattr(self.settings, "label_write_rate_limit_scope", "default") or "default"
+        )
+        self.rate_limit_config = LabelWriteRateLimitConfig(
+            enabled=bool(getattr(self.settings, "label_write_rate_limit_enabled", True)),
+            scope=self.rate_limit_scope,
+            per_second=int(getattr(self.settings, "label_write_limit_per_second", 4)),
+            per_hour=int(getattr(self.settings, "label_write_limit_per_hour", 9000)),
+            per_day=int(getattr(self.settings, "label_write_limit_per_day", 90000)),
+        )
+        self.local_rate_limit_retry_seconds = int(
+            getattr(self.settings, "label_write_local_retry_seconds", 30)
+        )
+        self.rate_limit_cooldown_seconds = int(
+            getattr(self.settings, "publish_rate_limit_cooldown_seconds", 900)
+        )
+        self.rate_limit_max_retry_after_seconds = int(
+            getattr(self.settings, "publish_rate_limit_max_retry_after_seconds", 3600)
+        )
+        self.rate_limit_jitter_seconds = int(
+            getattr(self.settings, "publish_rate_limit_jitter_seconds", 300)
+        )
 
         logger.info(
             "publish_worker_initialized",
@@ -82,6 +111,11 @@ class PublishWorker:
                 "max_attempts": self.max_attempts,
                 "ozone_base_url": ozone_base_url,
                 "created_by_did": self.client.created_by_did,
+                "rate_limit_enabled": self.rate_limit_config.enabled,
+                "rate_limit_scope": self.rate_limit_config.scope,
+                "label_write_limit_per_second": self.rate_limit_config.per_second,
+                "label_write_limit_per_hour": self.rate_limit_config.per_hour,
+                "label_write_limit_per_day": self.rate_limit_config.per_day,
             },
         )
 
@@ -113,6 +147,11 @@ class PublishWorker:
                     "batch_size": self.batch_size,
                     "lease_seconds": self.lease_seconds,
                     "created_by_did": self.client.created_by_did,
+                    "rate_limit_enabled": self.rate_limit_config.enabled,
+                    "rate_limit_scope": self.rate_limit_config.scope,
+                    "label_write_limit_per_second": self.rate_limit_config.per_second,
+                    "label_write_limit_per_hour": self.rate_limit_config.per_hour,
+                    "label_write_limit_per_day": self.rate_limit_config.per_day,
                 },
             )
 
@@ -185,6 +224,35 @@ class PublishWorker:
             if row is None:
                 return
 
+            permit = acquire_label_write_permit(
+                session,
+                config=self.rate_limit_config,
+                amount=1,
+                now=attempt_started_at,
+            )
+            if not permit.acquired:
+                retry_after_seconds = max(
+                    self.local_rate_limit_retry_seconds,
+                    int(permit.retry_after_seconds or 1),
+                )
+                release_job_for_local_rate_limit(
+                    row,
+                    now=attempt_started_at,
+                    retry_after_seconds=retry_after_seconds,
+                    reason_text=permit.reason_code or "local label-write quota exhausted",
+                )
+                logger.info(
+                    "publish_local_rate_limit_wait",
+                    extra={
+                        "worker_name": self.worker_name,
+                        "publish_job_id": publish_job_id,
+                        "retry_after_seconds": retry_after_seconds,
+                        "reason_code": permit.reason_code,
+                        "cooldown_until": permit.cooldown_until.isoformat() if permit.cooldown_until else None,
+                    },
+                )
+                return
+
             attempt_no = mark_attempt_started(row)
             uri = row.uri
             cid = row.cid
@@ -199,6 +267,8 @@ class PublishWorker:
                 duration_in_hours=None,
             )
             finished_at = utc_now()
+            external_event_id = str(response_json.get("id")) if response_json.get("id") is not None else None
+            external_created_at = parse_external_created_at(response_json.get("createdAt"))
 
             with session_scope() as session:
                 row = get_leased_publish_job_for_worker(
@@ -220,13 +290,16 @@ class PublishWorker:
                     http_status=200,
                     error_code=None,
                     error_text=None,
-                    external_event_id=str(response_json.get("id")) if response_json.get("id") is not None else None,
-                    external_created_at=parse_external_created_at(response_json.get("createdAt")),
+                    external_event_id=external_event_id,
+                    external_created_at=external_created_at,
                     response_json=response_json,
+                    retry_after_seconds=None,
                 )
                 mark_job_published(
                     row,
                     published_at=finished_at,
+                    external_event_id=external_event_id,
+                    external_created_at=external_created_at,
                 )
 
             logger.info(
@@ -252,7 +325,43 @@ class PublishWorker:
                 if row is None:
                     return
 
-                result_status = "error" if (not exc.retryable or attempt_no >= self.max_attempts) else "retry_pending"
+                if exc.http_status == 429:
+                    retry_after_seconds = exc.retry_after_seconds or self.rate_limit_cooldown_seconds
+                    retry_after_seconds = min(
+                        max(1, int(retry_after_seconds)),
+                        max(1, self.rate_limit_max_retry_after_seconds),
+                    )
+                    cooldown_until = set_label_write_cooldown(
+                        session,
+                        scope=self.rate_limit_scope,
+                        cooldown_seconds=retry_after_seconds,
+                        reason_code="remote_429",
+                        http_status=exc.http_status,
+                        last_error_text=exc.error_text,
+                        now=finished_at,
+                    )
+                    actual_delay = mark_job_rate_limited(
+                        row,
+                        now=finished_at,
+                        retry_after_seconds=retry_after_seconds,
+                        jitter_seconds=self.rate_limit_jitter_seconds,
+                        error_text=exc.error_text,
+                    )
+                    result_status = "rate_limited"
+                else:
+                    retry_after_seconds = exc.retry_after_seconds
+                    cooldown_until = None
+                    actual_delay = None
+                    result_status = "error" if (not exc.retryable or attempt_no >= self.max_attempts) else "retry_pending"
+                    mark_job_retry_or_error(
+                        row,
+                        error_code=exc.error_code,
+                        error_text=exc.error_text,
+                        max_attempts=self.max_attempts,
+                        backoff_base_seconds=self.backoff_base_seconds,
+                        retryable=exc.retryable,
+                        now=finished_at,
+                    )
 
                 insert_publish_attempt(
                     session,
@@ -268,15 +377,7 @@ class PublishWorker:
                     external_event_id=None,
                     external_created_at=None,
                     response_json=exc.response_json,
-                )
-                mark_job_retry_or_error(
-                    row,
-                    error_code=exc.error_code,
-                    error_text=exc.error_text,
-                    max_attempts=self.max_attempts,
-                    backoff_base_seconds=self.backoff_base_seconds,
-                    retryable=exc.retryable,
-                    now=finished_at,
+                    retry_after_seconds=retry_after_seconds,
                 )
 
             logger.warning(
@@ -290,5 +391,9 @@ class PublishWorker:
                     "http_status": exc.http_status,
                     "error_code": exc.error_code,
                     "retryable": exc.retryable,
+                    "result_status": result_status,
+                    "retry_after_seconds": retry_after_seconds,
+                    "actual_delay_seconds": actual_delay,
+                    "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
                 },
             )

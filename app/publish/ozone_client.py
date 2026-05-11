@@ -4,6 +4,8 @@ import base64
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib import error, request
 
@@ -29,6 +31,8 @@ class OzonePublishError(Exception):
         error_text: str,
         response_json: dict[str, Any] | None,
         retryable: bool,
+        retry_after_seconds: int | None = None,
+        response_headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(error_text)
         self.http_status = http_status
@@ -36,6 +40,8 @@ class OzonePublishError(Exception):
         self.error_text = error_text
         self.response_json = response_json
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        self.response_headers = response_headers or {}
 
 
 class OzoneClient:
@@ -95,6 +101,65 @@ class OzoneClient:
             return True
         return time.time() < (self._token_cache.expires_at_epoch - skew_seconds)
 
+    def _headers_to_dict(self, headers: Any) -> dict[str, str]:
+        out: dict[str, str] = {}
+        try:
+            for key, value in headers.items():
+                out[str(key).lower()] = str(value)
+        except Exception:
+            pass
+        return out
+
+    def _parse_retry_after_seconds(self, headers: dict[str, str]) -> int | None:
+        value = headers.get("retry-after")
+        if not value:
+            return None
+
+        value = value.strip()
+        try:
+            return max(1, int(float(value)))
+        except Exception:
+            pass
+
+        try:
+            dt = parsedate_to_datetime(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(1, int((dt - datetime.now(timezone.utc)).total_seconds()))
+        except Exception:
+            return None
+
+    def _publish_error_from_http_error(
+        self,
+        exc: error.HTTPError,
+        *,
+        body: dict[str, Any] | None,
+    ) -> OzonePublishError:
+        headers = self._headers_to_dict(exc.headers)
+        retry_after_seconds = self._parse_retry_after_seconds(headers)
+
+        if exc.code == 429:
+            error_code = "rate_limited"
+        else:
+            error_code = "http_error"
+
+        error_text = f"HTTP {exc.code}"
+        if isinstance(body, dict):
+            error_code = str(body.get("error") or error_code)
+            error_text = str(body.get("message") or error_text)
+            if exc.code == 429 and error_code == "http_error":
+                error_code = "rate_limited"
+
+        return OzonePublishError(
+            http_status=exc.code,
+            error_code=error_code,
+            error_text=error_text,
+            response_json=body if isinstance(body, dict) else None,
+            retryable=exc.code == 429 or 500 <= exc.code < 600,
+            retry_after_seconds=retry_after_seconds,
+            response_headers=headers,
+        )
+
     def _login(self, *, force_refresh: bool) -> str:
         if not force_refresh and self._is_token_fresh():
             assert self._token_cache is not None
@@ -128,18 +193,15 @@ class OzoneClient:
             except Exception:
                 body = None
 
-            error_code = "create_session_failed"
-            error_text = f"HTTP {exc.code}"
-            if isinstance(body, dict):
-                error_code = str(body.get("error") or error_code)
-                error_text = str(body.get("message") or error_text)
-
+            publish_error = self._publish_error_from_http_error(exc, body=body)
             raise OzonePublishError(
-                http_status=exc.code,
-                error_code=error_code,
-                error_text=error_text,
-                response_json=body if isinstance(body, dict) else None,
+                http_status=publish_error.http_status,
+                error_code="create_session_failed" if publish_error.error_code == "http_error" else publish_error.error_code,
+                error_text=publish_error.error_text,
+                response_json=publish_error.response_json,
                 retryable=False,
+                retry_after_seconds=publish_error.retry_after_seconds,
+                response_headers=publish_error.response_headers,
             ) from exc
 
         access_jwt = body.get("accessJwt")
@@ -232,34 +294,9 @@ class OzoneClient:
                         retry_body = json.loads(raw.decode("utf-8")) if raw else None
                     except Exception:
                         retry_body = None
+                    raise self._publish_error_from_http_error(retry_exc, body=retry_body) from retry_exc
 
-                    error_code = "http_error"
-                    error_text = f"HTTP {retry_exc.code}"
-                    if isinstance(retry_body, dict):
-                        error_code = str(retry_body.get("error") or error_code)
-                        error_text = str(retry_body.get("message") or error_text)
-
-                    raise OzonePublishError(
-                        http_status=retry_exc.code,
-                        error_code=error_code,
-                        error_text=error_text,
-                        response_json=retry_body if isinstance(retry_body, dict) else None,
-                        retryable=retry_exc.code == 429 or 500 <= retry_exc.code < 600,
-                    ) from retry_exc
-
-            error_code = "http_error"
-            error_text = f"HTTP {exc.code}"
-            if isinstance(body, dict):
-                error_code = str(body.get("error") or error_code)
-                error_text = str(body.get("message") or error_text)
-
-            raise OzonePublishError(
-                http_status=exc.code,
-                error_code=error_code,
-                error_text=error_text,
-                response_json=body if isinstance(body, dict) else None,
-                retryable=exc.code == 429 or 500 <= exc.code < 600,
-            ) from exc
+            raise self._publish_error_from_http_error(exc, body=body) from exc
 
         except OzonePublishError:
             raise

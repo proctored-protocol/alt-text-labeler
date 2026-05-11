@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.models import PublishAttempt, PublishJob, WorkerHeartbeat
+from app.models import PublishJob, WorkerHeartbeat
 
 
 def utc_now() -> datetime:
@@ -48,9 +49,12 @@ def lease_publish_batch(
                         PublishJob.lease_until < now,
                     ),
                 ),
-                PublishJob.attempt_count < max_attempts,
+                or_(
+                    PublishJob.attempt_count < max_attempts,
+                    PublishJob.last_error_code.in_(["rate_limited", "local_rate_limited"]),
+                ),
             )
-            .order_by(PublishJob.id.asc())
+            .order_by(PublishJob.next_attempt_at.asc(), PublishJob.id.asc())
             .limit(batch_size)
             .with_for_update(skip_locked=True)
         )
@@ -99,6 +103,7 @@ def get_leased_publish_job_for_worker(
 
 def mark_attempt_started(row: PublishJob) -> int:
     row.attempt_count += 1
+    row.last_attempt_at = utc_now()
     return int(row.attempt_count)
 
 
@@ -117,22 +122,68 @@ def insert_publish_attempt(
     external_event_id: str | None,
     external_created_at: datetime | None,
     response_json: dict | None,
+    retry_after_seconds: int | None = None,
 ) -> None:
-    session.add(
-        PublishAttempt(
-            publish_job_id=publish_job_id,
-            attempt_no=attempt_no,
-            worker_name=worker_name,
-            started_at=started_at,
-            finished_at=finished_at,
-            result_status=result_status,
-            http_status=http_status,
-            error_code=error_code,
-            error_text=error_text,
-            external_event_id=external_event_id,
-            external_created_at=external_created_at,
-            response_json=response_json,
-        )
+    session.execute(
+        text("""
+            INSERT INTO publish_attempt (
+                publish_job_id,
+                attempt_no,
+                worker_name,
+                started_at,
+                finished_at,
+                result_status,
+                http_status,
+                error_code,
+                error_text,
+                external_event_id,
+                external_created_at,
+                response_json,
+                retry_after_seconds
+            )
+            VALUES (
+                :publish_job_id,
+                :attempt_no,
+                :worker_name,
+                :started_at,
+                :finished_at,
+                :result_status,
+                :http_status,
+                :error_code,
+                :error_text,
+                :external_event_id,
+                :external_created_at,
+                CAST(:response_json AS jsonb),
+                :retry_after_seconds
+            )
+            ON CONFLICT (publish_job_id, attempt_no)
+            DO UPDATE SET
+                worker_name = EXCLUDED.worker_name,
+                finished_at = EXCLUDED.finished_at,
+                result_status = EXCLUDED.result_status,
+                http_status = EXCLUDED.http_status,
+                error_code = EXCLUDED.error_code,
+                error_text = EXCLUDED.error_text,
+                external_event_id = EXCLUDED.external_event_id,
+                external_created_at = EXCLUDED.external_created_at,
+                response_json = EXCLUDED.response_json,
+                retry_after_seconds = EXCLUDED.retry_after_seconds
+        """),
+        {
+            "publish_job_id": publish_job_id,
+            "attempt_no": attempt_no,
+            "worker_name": worker_name,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "result_status": result_status,
+            "http_status": http_status,
+            "error_code": error_code,
+            "error_text": error_text,
+            "external_event_id": external_event_id,
+            "external_created_at": external_created_at,
+            "response_json": None if response_json is None else __import__("json").dumps(response_json, ensure_ascii=False),
+            "retry_after_seconds": retry_after_seconds,
+        },
     )
 
 
@@ -140,9 +191,13 @@ def mark_job_published(
     row: PublishJob,
     *,
     published_at: datetime,
+    external_event_id: str | None = None,
+    external_created_at: datetime | None = None,
 ) -> None:
     row.status = "published"
     row.published_at = published_at
+    row.external_event_id = external_event_id
+    row.external_created_at = external_created_at
     row.lease_owner = None
     row.lease_until = None
     row.last_error_code = None
@@ -173,6 +228,41 @@ def mark_job_retry_or_error(
     backoff_seconds = backoff_base_seconds * (2 ** max(0, row.attempt_count - 1))
     row.status = "pending"
     row.next_attempt_at = now + timedelta(seconds=backoff_seconds)
+
+
+def mark_job_rate_limited(
+    row: PublishJob,
+    *,
+    now: datetime,
+    retry_after_seconds: int,
+    jitter_seconds: int,
+    error_text: str = "HTTP 429",
+) -> int:
+    jitter = random.randint(0, max(0, int(jitter_seconds)))
+    delay_seconds = max(1, int(retry_after_seconds)) + jitter
+
+    row.status = "pending"
+    row.next_attempt_at = now + timedelta(seconds=delay_seconds)
+    row.lease_owner = None
+    row.lease_until = None
+    row.last_error_code = "rate_limited"
+    row.last_error_text = error_text
+    return delay_seconds
+
+
+def release_job_for_local_rate_limit(
+    row: PublishJob,
+    *,
+    now: datetime,
+    retry_after_seconds: int,
+    reason_text: str,
+) -> None:
+    row.status = "pending"
+    row.next_attempt_at = now + timedelta(seconds=max(1, int(retry_after_seconds)))
+    row.lease_owner = None
+    row.lease_until = None
+    row.last_error_code = "local_rate_limited"
+    row.last_error_text = reason_text
 
 
 def count_publish_backlog(session: Session, *, now: datetime | None = None) -> int:

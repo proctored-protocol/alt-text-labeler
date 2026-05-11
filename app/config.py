@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -54,11 +54,41 @@ class Settings(BaseSettings):
     publish_enabled: bool = Field(default=False)
     publish_backend: str = Field(default="ozone")
 
-    publish_batch_size: int = Field(default=50)
-    publish_lease_seconds: int = Field(default=90)
+    publish_batch_size: int = Field(
+        default=50,
+        validation_alias=AliasChoices("PUBLISH_BATCH_SIZE", "PUBLISHER_BATCH_SIZE", "publish_batch_size"),
+    )
+    publish_lease_seconds: int = Field(
+        default=90,
+        validation_alias=AliasChoices("PUBLISH_LEASE_SECONDS", "PUBLISHER_LEASE_SECONDS", "publish_lease_seconds"),
+    )
     publish_idle_sleep_seconds: float = Field(default=1.0)
-    publish_max_attempts: int = Field(default=10)
-    publish_backoff_base_seconds: int = Field(default=15)
+    publish_max_attempts: int = Field(
+        default=10,
+        validation_alias=AliasChoices("PUBLISH_MAX_ATTEMPTS", "PUBLISHER_MAX_ATTEMPTS", "publish_max_attempts"),
+    )
+    publish_backoff_base_seconds: int = Field(
+        default=15,
+        validation_alias=AliasChoices(
+            "PUBLISH_BACKOFF_BASE_SECONDS",
+            "PUBLISHER_BACKOFF_BASE_SECONDS",
+            "publish_backoff_base_seconds",
+        ),
+    )
+
+    # Shared label-write limiter for publish/remediation writes.
+    # Defaults are intentionally below the documented Bluesky label limits
+    # to leave headroom for clock skew and remediation.
+    label_write_rate_limit_enabled: bool = Field(default=True)
+    label_write_rate_limit_scope: str = Field(default="default")
+    label_write_limit_per_second: int = Field(default=4)
+    label_write_limit_per_hour: int = Field(default=9000)
+    label_write_limit_per_day: int = Field(default=90000)
+    label_write_local_retry_seconds: int = Field(default=30)
+
+    publish_rate_limit_cooldown_seconds: int = Field(default=900)
+    publish_rate_limit_max_retry_after_seconds: int = Field(default=3600)
+    publish_rate_limit_jitter_seconds: int = Field(default=300)
 
     # --- visibility baseline worker -----------------------------------------
 
@@ -68,6 +98,7 @@ class Settings(BaseSettings):
     visibility_max_attempts: int = Field(default=5)
     visibility_retry_seconds: int = Field(default=30)
     visibility_max_age_seconds: int = Field(default=7200)
+    visibility_seed_lookback_seconds: int = Field(default=1800)
     visibility_request_timeout_seconds: int = Field(default=30)
     visibility_initial_delay_seconds: int = Field(default=300)
 
